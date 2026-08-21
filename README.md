@@ -1,4 +1,4 @@
-Helps keep track of and find all the current spells for the HorizonXI Server.
+Helps keep track of and lists all the current spells for the HorizonXI Server.
 
 Load with /addon load blutracker
 
