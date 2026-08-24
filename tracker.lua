@@ -75,8 +75,263 @@ table.sort(SORTED, function(a, b)
     return a.name < b.name
 end)
 
+-- Reverse map: formatted zone name -> zone id (for the live-map lookup used by
+-- the Zone tab, which knows a zone by name rather than by id).
+local ZONE_NAME_TO_ID = {}
+for id, nm in pairs(ZONES) do
+    if nm and nm ~= '' then ZONE_NAME_TO_ID[nm] = id end
+end
+
+-- A few learn-from zone strings are spelled differently from the canonical zone
+-- names used by data/bluemage_zones.lua and data/mob_positions.lua (e.g. an
+-- apostrophe). Map those variants to the canonical name so the map lookup, the
+-- "you are here" check, and the spell list all agree. Identity for everything
+-- else; only known variants are listed (no fuzzy merging, to avoid collapsing
+-- genuinely distinct zones).
+local ZONE_ALIAS = {
+    ["Pso'Xja"] = 'PsoXja',
+}
+local function Canon(name)
+    if not name then return name end
+    return ZONE_ALIAS[name] or name
+end
+
+-- Every zone that appears as a learn-from location, canonicalised and sorted for
+-- the Zone tab picker. Built from the learn-from table so the list only offers
+-- zones that actually teach at least one Blue Magic spell.
+local ZONE_LIST = {}
+do
+    local seen = {}
+    for _, r in ipairs(SORTED) do
+        local rows = LF.DATA[r.key]
+        if rows then
+            for _, row in ipairs(rows) do
+                local zn = Canon(row[3])
+                if zn and zn ~= '' and not seen[zn] then
+                    seen[zn] = true
+                    ZONE_LIST[#ZONE_LIST + 1] = zn
+                end
+            end
+        end
+    end
+    table.sort(ZONE_LIST)
+end
+
+-- The zone id for a (canonical) zone name.
+local function ZoneIdOf(zone)
+    return ZONE_NAME_TO_ID[zone] or (POS[zone] and POS[zone].zoneid) or nil
+end
+
+-- Cached live floor list per zone id (gamemap.get_floors is a client read; a
+-- zone's floors don't change during a session). Returns the floors array or nil.
+local ZONE_FLOORS_CACHE = {}
+local function FloorsFor(zoneid)
+    if not zoneid then return nil end
+    local c = ZONE_FLOORS_CACHE[zoneid]
+    if c ~= nil then return c or nil end
+    local f = gamemap and gamemap.get_floors and gamemap.get_floors(zoneid) or nil
+    ZONE_FLOORS_CACHE[zoneid] = f or false
+    return f
+end
+
+-- Which floor (from a floors list) a world point belongs to.
+--   1. Floors whose X/Z rectangle contains the point are candidates.
+--   2. Exactly one candidate -> that floor. This is the key case for zones that
+--      are split HORIZONTALLY into several map pages (e.g. Kuftal Tunnel): each
+--      point sits in only one page's rectangle, so it's placed correctly with no
+--      need for height at all. (Same result as gamemap.get_best, which the hover
+--      maps use.)
+--   3. Several candidates (floors that OVERLAP in X/Z, i.e. vertically stacked):
+--      disambiguate by, in order: the game's floor function (resolver, exact),
+--      then learned per-floor height (medY), then smallest area.
+--   4. No candidate -> nearest floor centre.
+-- `nfHint` (optional) is the exact floor id from the game's floor function for
+-- this position (cached by the caller); only consulted when floors overlap.
+local function PickFloor(floors, px, pz, py, nfHint)
+    local cands
+    for _, f in ipairs(floors) do
+        local b = f.bounds
+        if px >= b.minX and px <= b.maxX and pz >= b.minZ and pz <= b.maxZ then
+            cands = cands or {}
+            cands[#cands + 1] = f
+        end
+    end
+    if cands and #cands == 1 then
+        return cands[1]
+    elseif cands then
+        -- Overlapping candidates: use the game's answer first (exact for stacks).
+        if nfHint then
+            for _, f in ipairs(cands) do if f.floorid == nfHint then return f end end
+        end
+        -- Then learned height.
+        if py ~= nil then
+            local best, bestD
+            for _, f in ipairs(cands) do
+                if f.medY ~= nil then
+                    local d = math.abs(f.medY - py)
+                    if not bestD or d < bestD then best, bestD = f, d end
+                end
+            end
+            if best then return best end
+        end
+        -- Else smallest area.
+        local best, bestArea
+        for _, f in ipairs(cands) do
+            local b = f.bounds
+            local a = (b.maxX - b.minX) * (b.maxZ - b.minZ)
+            if not bestArea or a < bestArea then best, bestArea = f, a end
+        end
+        return best
+    end
+    -- Nothing contains it: nearest centre.
+    local best, bestD
+    for _, f in ipairs(floors) do
+        local b = f.bounds
+        local mx = (b.minX + b.maxX) * 0.5
+        local mz = (b.minZ + b.maxZ) * 0.5
+        local d = (mx - px) * (mx - px) + (mz - pz) * (mz - pz)
+        if not bestD or d < bestD then best, bestD = f, d end
+    end
+    return best
+end
+
+-- Median of a numeric array (array is sorted in place).
+local function median(a)
+    if #a == 0 then return nil end
+    table.sort(a)
+    local n = #a
+    if n % 2 == 1 then return a[(n + 1) / 2] end
+    return (a[n / 2] + a[n / 2 + 1]) * 0.5
+end
+
+-- Split sorted heights into natural bands: start a new band wherever there's a
+-- vertical gap larger than minGap. Bands with fewer than minCount points are
+-- dropped (noise/outliers). Returns an array of band medians, low to high.
+local function HeightBands(ys, minGap, minCount)
+    if #ys == 0 then return {} end
+    table.sort(ys)
+    local bands, cur = {}, { ys[1] }
+    for i = 2, #ys do
+        if (ys[i] - ys[i - 1]) > minGap then
+            bands[#bands + 1] = cur; cur = {}
+        end
+        cur[#cur + 1] = ys[i]
+    end
+    bands[#bands + 1] = cur
+    local out = {}
+    for _, b in ipairs(bands) do
+        if #b >= minCount then out[#out + 1] = median(b) end
+    end
+    return out
+end
+
+-- Height model for a zone's floors. Returns ALL drawable map floors (from the
+-- client), each annotated with world `bounds` and, when the zone is vertically
+-- stacked, a learned `medY` (its height) used to disambiguate overlapping
+-- floors. It does NOT decide which floors are "in use" -- the draw code does
+-- that from where the plotted points actually land, so horizontally-split zones
+-- (Kuftal), stacked zones (Gusgen), and duplicate map images are all handled by
+-- the same PickFloor pass. Cached per zone.
+--
+-- Height learning: floors with X/Z-unambiguous spawns learn their height
+-- directly (anchors); floors nested inside another get matched to leftover
+-- height bands found in the data. With no real vertical separation (one band)
+-- height is left off, so duplicate map images collapse via smallest-area.
+local MIN_FLOOR_ANCHOR = 3      -- unambiguous samples needed to trust a floor's height
+local MIN_FLOOR_GAP    = 6.0    -- vertical gap (yalms) that separates two floors
+local ZONE_FLOORS_CACHE2 = {}
+local function ZoneFloors(zone)
+    local c = Canon(zone)
+    local cached = ZONE_FLOORS_CACHE2[c]
+    if cached ~= nil then return cached or nil end
+
+    local full = FloorsFor(ZoneIdOf(c))
+    if not full then ZONE_FLOORS_CACHE2[c] = false; return nil end
+
+    for i, f in ipairs(full) do f.num = i - 1; f.medY = nil end
+
+    local zc = POS[c]
+    if not (zc and zc.mobs) or #full <= 1 then
+        ZONE_FLOORS_CACHE2[c] = full
+        return full
+    end
+
+    -- Scan points once: per-floor anchor heights (from X/Z-unambiguous spawns),
+    -- whether any floors overlap in X/Z, and the pool of all in-floor heights.
+    local samples, allY, hasOverlap = {}, {}, false
+    for _, f in ipairs(full) do samples[f.floorid] = {} end
+    for _, pts in pairs(zc.mobs) do
+        for _, p in ipairs(pts) do
+            if p.y ~= nil then
+                local only, cnt = nil, 0
+                for _, f in ipairs(full) do
+                    local b = f.bounds
+                    if p.x >= b.minX and p.x <= b.maxX and p.z >= b.minZ and p.z <= b.maxZ then
+                        cnt = cnt + 1; only = f
+                    end
+                end
+                if cnt >= 1 then allY[#allY + 1] = p.y end
+                if cnt == 1 then local s = samples[only.floorid]; s[#s + 1] = p.y end
+                if cnt >= 2 then hasOverlap = true end
+            end
+        end
+    end
+
+    for _, f in ipairs(full) do
+        local s = samples[f.floorid]
+        f.medY = (#s >= MIN_FLOOR_ANCHOR) and median(s) or nil
+    end
+
+    -- Only bother with height when floors actually overlap in X/Z. When they
+    -- don't, every point is unambiguous and medY is never consulted.
+    if hasOverlap then
+        local minCount = math.max(3, math.floor(#allY * 0.05))
+        local bands = HeightBands(allY, MIN_FLOOR_GAP, minCount)
+        if #bands >= 2 then
+            local taken = {}
+            for _, f in ipairs(full) do
+                if f.medY ~= nil then
+                    local bi, bd
+                    for i, cY in ipairs(bands) do
+                        local d = math.abs(cY - f.medY)
+                        if not bd or d < bd then bi, bd = i, d end
+                    end
+                    if bi then taken[bi] = true end
+                end
+            end
+            local leftover = {}
+            for i, cY in ipairs(bands) do if not taken[i] then leftover[#leftover + 1] = cY end end
+            local li = 1
+            for _, f in ipairs(full) do
+                if f.medY == nil and leftover[li] then
+                    f.medY = leftover[li]; li = li + 1
+                end
+            end
+        else
+            for _, f in ipairs(full) do f.medY = nil end
+        end
+    end
+
+    ZONE_FLOORS_CACHE2[c] = full
+    return full
+end
+
 -- Currently selected spell (its learn-from detail is shown in the panel).
 local selectedKey = nil
+
+-- Zone tab transient state (per session; the picker defaults to the player's
+-- current zone the first time the tab is drawn).
+local zoneTabZone        = nil       -- selected zone name
+local zoneTabSearch      = { '' }    -- picker filter text
+local zoneTabSpellKey    = nil       -- spell whose mobs are highlighted on the map
+local zoneTabHideLearned = { false } -- hide spells you already know
+local zoneTabFloor       = {}        -- canonical zone name -> pinned floor id (nil = auto)
+
+-- The zone picker lists zone names only. Floors are switched with the in-map
+-- floor buttons, so per-floor entries were dropped from the dropdown.
+local function CurrentZoneLabel()
+    return zoneTabZone or 'Select a zone...'
+end
 
 -- Set in M.init from host:
 local cfg         = nil  -- bound to host.cfg
@@ -84,6 +339,10 @@ local vt          = nil  -- bound to host.vt
 local settings    = nil  -- bound to host.settings
 local helpers     = nil  -- bound to host.helpers
 local default_cfg = nil  -- bound to host.default_config
+-- In-memory native map-floor cache: FLOORCACHE[canonZone][mobName] = { floorids }
+-- (-1 means "no floor"). Persisted to cfg.bluemage_floorcache_str as a single
+-- self-encoded string (robust across the settings serializer).
+local FLOORCACHE  = {}
 
 -- Bound subtable of cfg.bluemage_data once init() runs:
 local learned = nil   -- key -> bool
@@ -166,6 +425,8 @@ M.default_window = {
     bluemage_auto_learn    = true,
     bluemage_hide_learned  = false,
     bluemage_only_my_level = false,
+    bluemage_map_scale       = 1.0,
+    bluemage_show_player     = true,
     bluemage_bg_color_r    = 0.06,
     bluemage_bg_color_g    = 0.07,
     bluemage_bg_color_b    = 0.10,
@@ -276,19 +537,220 @@ local function GetCurrentZone()
     return zid, ZONES[zid]
 end
 
+-- Player's live position as (wx, wy, wh): wx/wy are the horizontal world plane
+-- matching the mob-map (world x, world z), and wh is height (world y), used to
+-- pick the right floor in vertically stacked zones. Returns nil if unreadable.
+-- Per the gamemap note "client Y == server Z", the client axis that lines up
+-- with the map's vertical is the entity's Y and height is the entity's Z.
+local function GetPlayerPos()
+    local mm = AshitaCore and AshitaCore:GetMemoryManager()
+    if not mm then return nil end
+    local party = mm:GetParty()
+    local ent   = mm:GetEntity()
+    if not party or not ent then return nil end
+    local ok_i, idx = pcall(function() return party:GetMemberTargetIndex(0) end)
+    if not ok_i or not idx or idx == 0 then return nil end
+    local ok, wx, wy, wh = pcall(function()
+        local x = ent:GetLocalPositionX(idx)
+        local y = ent:GetLocalPositionY(idx)   -- world z (map vertical / depth)
+        local h = ent:GetLocalPositionZ(idx)   -- world y (height)
+        return x, y, h
+    end)
+    if not ok or wx == nil or wy == nil then return nil end
+    return wx, wy, wh
+end
+
+-- Whether to use the game's own (exact) floor detection for a zone: only for
+-- the zone the player is standing in, when enabled and the client function was
+-- found. Elsewhere we fall back to the height heuristic.
+local function NativeFloorsActive(canon)
+    if not (gamemap and gamemap.floor_id_available and gamemap.floor_id_available()) then return false end
+    local _, cz = GetCurrentZone()
+    return cz ~= nil and Canon(cz) == canon
+end
+
+-- Native floor id for a mob point (server-order coords x, y=height, z=depth).
+-- The game's floor function only answers for the CURRENTLY LOADED zone, so we
+-- only ever compute a value while standing in the point's zone (activeNow), and
+-- we cache the authoritative result on the point (p._nfl) so it can be reused
+-- later when BROWSING that zone from elsewhere. `false` means "asked the game,
+-- there was no floor"; nil means "unknown / not computable right now".
+local function NativeFloorOfPoint(p, activeNow)
+    if p._nfl ~= nil then return p._nfl or nil end   -- cached from a prior visit
+    if activeNow and gamemap and gamemap.get_floor_id then
+        local fid = gamemap.get_floor_id(p.x, p.y, p.z)
+        p._nfl = fid or false
+        return fid
+    end
+    return nil   -- don't guess for a zone we're not in
+end
+
+-- Zones whose spawn points have had their native floors captured this session.
+local nativeScanned = {}
+
+-- Encode/decode the whole floor cache as one string: records "zone|mob|csv"
+-- joined by ';' (csv = comma-joined floor ids, -1 = no floor). Uses only
+-- printable separators that never appear in zone/mob names, and a single string
+-- value round-trips cleanly through the settings serializer.
+local function SerializeFloorCache()
+    local recs = {}
+    for zone, mobs in pairs(FLOORCACHE) do
+        for mob, arr in pairs(mobs) do
+            recs[#recs + 1] = zone .. '|' .. mob .. '|' .. table.concat(arr, ',')
+        end
+    end
+    return table.concat(recs, ';')
+end
+
+local function DeserializeFloorCache(str)
+    local out = {}
+    if type(str) ~= 'string' or str == '' then return out end
+    for rec in (str .. ';'):gmatch('([^;]*);') do
+        if rec ~= '' then
+            local zone, mob, csv = rec:match('^([^|]*)|([^|]*)|(.*)$')
+            if zone and mob then
+                local arr = {}
+                for n in (csv or ''):gmatch('([^,]+)') do arr[#arr + 1] = tonumber(n) end
+                out[zone] = out[zone] or {}
+                out[zone][mob] = arr
+            end
+        end
+    end
+    return out
+end
+
+-- Persist a zone's captured native floor ids into the (main) settings, as part
+-- of the single encoded string. Only multi-floor zones are worth caching. Never
+-- wipes other zones -- it re-serializes the whole in-memory cache. Guarded.
+local function PersistZoneFloors(canon)
+    local zc = POS[canon]
+    if not (zc and zc.mobs) then return end
+    local floors = ZoneFloors(canon)
+    if not floors or #floors <= 1 then return end   -- single map: no ambiguity to cache
+
+    local rec, any = {}, false
+    for mob, pts in pairs(zc.mobs) do
+        local arr, known = {}, false
+        for i, p in ipairs(pts) do
+            if type(p._nfl) == 'number' then arr[i] = p._nfl; known = true
+            else arr[i] = -1 end
+        end
+        if known then rec[mob] = arr; any = true end
+    end
+    if not any then return end
+
+    FLOORCACHE[canon] = rec
+    if cfg and settings then
+        pcall(function()
+            cfg.bluemage_floorcache_str = SerializeFloorCache()
+            settings.save()
+        end)
+    end
+end
+
+-- Load the persisted cache into memory and apply it to the spawn points, so a
+-- zone captured in a previous session is already correct when browsed.
+local function HydrateFloorCache()
+    FLOORCACHE = DeserializeFloorCache(cfg and cfg.bluemage_floorcache_str)
+    for zone, mobs in pairs(FLOORCACHE) do
+        local zc = POS[zone]
+        if zc and zc.mobs then
+            for mob, arr in pairs(mobs) do
+                local pts = zc.mobs[mob]
+                if pts and #pts == #arr then
+                    for i, p in ipairs(pts) do
+                        local v = arr[i]
+                        if type(v) == 'number' and v >= 0 then p._nfl = v
+                        elseif v == -1 then p._nfl = false end
+                    end
+                end
+            end
+        end
+    end
+end
+
+-- Capture native floor ids for every spawn point in a zone (once), while we're
+-- standing in it, so browsing it later places dots on the correct floors. The
+-- result is also written to the persisted cache. Only proceeds once the zone
+-- map is actually loaded -- probed via the player's own position, which always
+-- resolves to a real floor -- so it won't cache empty results right after you
+-- zone in (it simply retries on a later frame).
+local function ScanZoneFloors(canon)
+    if nativeScanned[canon] then return end
+    local zc = POS[canon]
+    if not (zc and zc.mobs) then nativeScanned[canon] = true; return end
+    if not (gamemap and gamemap.get_floor_id) then return end
+
+    local pwx, pwy, pwh = GetPlayerPos()
+    if not pwx then return end                                  -- position not ready
+    if type(gamemap.get_floor_id(pwx, pwh, pwy)) ~= 'number' then return end  -- zone map not loaded yet
+
+    for _, pts in pairs(zc.mobs) do
+        for _, p in ipairs(pts) do NativeFloorOfPoint(p, true) end
+    end
+    nativeScanned[canon] = true
+    PersistZoneFloors(canon)
+end
+
+-- Whether a zone's floor assignment can be trusted (dots are authoritative):
+-- single-map zones always are; multi-floor zones only once their real floors
+-- have been captured from the game (in-zone now, this session, or hydrated from
+-- the persisted cache). Otherwise dots come from the estimate and may be wrong.
+local function ZoneFloorsTrusted(canon)
+    local floors = ZoneFloors(canon)
+    if not floors or #floors <= 1 then return true end
+    if NativeFloorsActive(canon) then return true end
+    if nativeScanned[canon] then return true end
+    local zc = POS[canon]
+    if zc and zc.mobs then
+        for _, pts in pairs(zc.mobs) do
+            for _, p in ipairs(pts) do
+                if type(p._nfl) == 'number' then return true end
+            end
+        end
+    end
+    return false
+end
+
 -- Spells learnable in the given zone name: unlearned spells whose learn-from
 -- data lists a mob in that zone. Returns an array of
 -- { rec, mobs = { {mob, level}, ... } } (every mob for that spell in the zone).
 local function SpellsInZone(zoneName)
     local out = {}
     if not zoneName then return out end
+    zoneName = Canon(zoneName)
     for _, r in ipairs(SORTED) do
         if not learned[r.key] then
             local rows = LF.DATA[r.key]
             if rows then
                 local mobs = {}
                 for _, row in ipairs(rows) do
-                    if row[3] == zoneName then
+                    if Canon(row[3]) == zoneName then
+                        mobs[#mobs + 1] = { row[1], row[2] }
+                    end
+                end
+                if #mobs > 0 then
+                    out[#out + 1] = { rec = r, mobs = mobs }
+                end
+            end
+        end
+    end
+    return out
+end
+
+-- Like SpellsInZone, but for the Zone tab: includes already-learned spells
+-- (unless hideLearned) so the tab works as a "what can I learn here" browser.
+local function AllSpellsInZone(zoneName, hideLearned)
+    local out = {}
+    if not zoneName then return out end
+    zoneName = Canon(zoneName)
+    for _, r in ipairs(SORTED) do
+        if not (hideLearned and learned[r.key]) then
+            local rows = LF.DATA[r.key]
+            if rows then
+                local mobs = {}
+                for _, row in ipairs(rows) do
+                    if Canon(row[3]) == zoneName then
                         mobs[#mobs + 1] = { row[1], row[2] }
                     end
                 end
@@ -476,7 +938,7 @@ local function DrawSpellRow(r, bluLvl, skill)
         imgui.Text(('%s  -  %s'):format(
             (r.kind == 'Phys') and 'Physical' or 'Magical', r.role))
         imgui.Text(('Usable at Lv %d   -   Learn by Lv %s (capped skill)'):format(r.lvl, MRL[r.key] and tostring(MRL[r.key]) or '?'))
-        imgui.Text(('Needs Blue Magic skill %d  -  skill+ gear can learn earlier'):format(REQSK[r.key] or 0))
+        imgui.Text(('Needs Blue Magic skill %d'):format(REQSK[r.key] or 0))
         imgui.Text('Type: ' .. r.elem)
         imgui.Text('Trait when set: ' .. r.trait)
         imgui.Text('Effect / SC: ' .. (r.prop or '-'))
@@ -585,7 +1047,20 @@ end
 --   * Fallback: a plain data-bounds grid (no calibration needed).
 -- Returns true if it had data to draw.
 -- =========================
-local MAP_W, MAP_H, MAP_PAD = 240, 240, 10
+-- Base sizes; the actual pixel size is the base times the user's map scale.
+local MAP_BASE      = 240   -- hover mini-map (Spells / Tracker) -- scaled by MapScale()
+local MAP_BASE_ZONE = 360   -- fallback size for the Zone-tab map
+local MAP_ZONE_MIN  = 300   -- Zone-tab map fills its pane, clamped to this range
+local MAP_ZONE_MAX  = 480   -- (the Zone-tab map is NOT affected by the map-scale setting)
+local MAP_PAD       = 10
+
+-- User-configurable map size multiplier (clamped to a sane range).
+local function MapScale()
+    local s = cfg and cfg.bluemage_map_scale or 1.0
+    if type(s) ~= 'number' or s <= 0 then s = 1.0 end
+    if s < 0.5 then s = 0.5 elseif s > 3.0 then s = 3.0 end
+    return s
+end
 
 local function u32(r, g, b, a)
     return imgui.GetColorU32({ r, g, b, a or 1.0 })
@@ -625,18 +1100,127 @@ local function load_map_texture(imageName)
     return result
 end
 
+-- The marker glyph itself (dark halo + cyan ring + bright core).
+local function DrawPlayerDot(dl, sx, sy)
+    dl:AddCircleFilled({ sx, sy }, 5.5, u32(0.02, 0.03, 0.05, 0.7))
+    pcall(function() dl:AddCircle({ sx, sy }, 5.5, u32(0.20, 0.85, 1.00, 1.0), 14, 2.0) end)
+    dl:AddCircleFilled({ sx, sy }, 2.8, u32(0.95, 0.99, 1.00, 1.0))
+end
+
+-- Draw a marker at the player's live position on a map, but ONLY when the
+-- player is actually standing in the zone the map depicts. `to_screen` is the
+-- same world->screen transform the map used for its mob dots, so the marker
+-- lines up with them. `floorOk` (optional) gates multi-floor zones: pass false
+-- when the player is on a different floor than the one being drawn. Returns
+-- true if a marker was drawn.
+local function DrawPlayerMarker(dl, to_screen, ix0, iy0, ix1, iy1, zoneName, floorOk)
+    if not cfg or cfg.bluemage_show_player == false then return false end
+    if floorOk == false then return false end                      -- wrong floor
+    local _, curZone = GetCurrentZone()
+    if not curZone or Canon(curZone) ~= Canon(zoneName) then return false end   -- not on this map
+    local wx, wy = GetPlayerPos()
+    if not wx then return false end
+
+    pcall(function()
+        local sx, sy = to_screen(wx, wy)
+        if sx < ix0 then sx = ix0 elseif sx > ix1 then sx = ix1 end
+        if sy < iy0 then sy = iy0 elseif sy > iy1 then sy = iy1 end
+        DrawPlayerDot(dl, sx, sy)
+    end)
+    return true
+end
+
 local function DrawMobMap(zoneName, mobName)
-    local zc = POS[zoneName]
+    local canon = Canon(zoneName)
+    local zc = POS[canon]
     if not zc or not zc.mobs then return false end
     local pts = zc.mobs[mobName]
     if not pts or #pts == 0 then return false end
+
+    -- Floor-aware point selection (mirrors the Zone-tab map). For a multi-floor
+    -- zone, place each spawn point on its REAL floor using the native floor ids
+    -- captured while visiting the zone (cached on the point as p._nfl, or read
+    -- live when we're standing there), then show just ONE floor on ONE floor
+    -- map -- the floor you're on if you're in the zone and the mob spawns on it,
+    -- otherwise the floor it spawns on most -- instead of dumping every floor's
+    -- dots onto a single averaged map. Single-floor zones (and any case where a
+    -- live floor map isn't available) fall back to the old all-points behaviour.
+    local zoneid  = zc.zoneid or ZONE_NAME_TO_ID[canon]
+    local drawPts = pts        -- the points actually plotted
+    local selFid              -- chosen floorid (nil = not floor-filtered)
+    local selEntry           -- chosen floor's live map entry (world->ref), or nil
+    local selTex             -- chosen floor's texture id, or nil
+    local floorNote          -- e.g. ' - Floor 2' appended to the header, or nil
+
+    do
+        local floors = ZoneFloors(canon)
+        if floors and #floors > 1 and zoneid and gamemap and gamemap.get
+           and ZoneFloorsTrusted(canon) then
+            local useNative = NativeFloorsActive(canon)
+            if useNative then ScanZoneFloors(canon) end
+
+            -- Bucket this mob's points by floor (cached hint when known).
+            local byFloor, counts, order = {}, {}, {}
+            for _, p in ipairs(pts) do
+                local hint = NativeFloorOfPoint(p, useNative)
+                local f = PickFloor(floors, p.x, p.z, p.y, hint)
+                if f then
+                    if not byFloor[f.floorid] then
+                        byFloor[f.floorid] = {}; order[#order + 1] = f.floorid
+                    end
+                    local t = byFloor[f.floorid]; t[#t + 1] = p
+                    counts[f.floorid] = (counts[f.floorid] or 0) + 1
+                end
+            end
+
+            -- Prefer the floor you're standing on (if the mob spawns there),
+            -- else the floor this mob spawns on most.
+            local pwx, pwy, pwh = GetPlayerPos()
+            local _, curZone = GetCurrentZone()
+            if pwx and curZone and Canon(curZone) == canon and gamemap.get_floor_id then
+                local pf = PickFloor(floors, pwx, pwy, pwh, gamemap.get_floor_id(pwx, pwh, pwy))
+                if pf and counts[pf.floorid] then selFid = pf.floorid end
+            end
+            if not selFid then
+                local bestN
+                for _, fid in ipairs(order) do
+                    if not bestN or counts[fid] > bestN then bestN, selFid = counts[fid], fid end
+                end
+            end
+
+            if selFid then
+                local fl = gamemap.get(zoneid, selFid)
+                if fl and fl.entry then
+                    selEntry = fl.entry
+                    selTex   = fl.id
+                    drawPts  = byFloor[selFid] or pts
+                    -- 0-based floor number, in the same bounds order the Zone map
+                    -- uses, but only counting floors that hold this mob's points.
+                    local n = 0
+                    for _, f in ipairs(floors) do
+                        if byFloor[f.floorid] then
+                            if f.floorid == selFid then floorNote = (' - Floor %d'):format(n); break end
+                            n = n + 1
+                        end
+                    end
+                else
+                    selFid = nil   -- no live map for that floor: fall back cleanly
+                end
+            end
+        end
+    end
+
+    -- Scaled hover mini-map size.
+    local MAP_W = math.floor(MAP_BASE * MapScale())
+    local MAP_H = MAP_W
 
     -- Header (auto-sizes the tooltip).
     imgui.PushStyleColor(ImGuiCol_Text, { 0.85, 0.92, 1.00, 1.0 })
     imgui.Text(mobName)
     imgui.PopStyleColor(1)
     imgui.PushStyleColor(ImGuiCol_Text, { 0.62, 0.66, 0.80, 1.0 })
-    imgui.Text(('%s   -   %d spawn point%s'):format(zoneName, #pts, (#pts == 1) and '' or 's'))
+    imgui.Text(('%s   -   %d spawn point%s%s'):format(
+        zoneName, #drawPts, (#drawPts == 1) and '' or 's', floorNote or ''))
     imgui.PopStyleColor(1)
 
     local ox, oy = imgui.GetCursorScreenPos()
@@ -649,14 +1233,16 @@ local function DrawMobMap(zoneName, mobName)
     local ix1, iy1 = x1 - MAP_PAD, y1 - MAP_PAD
     local iw, ih = ix1 - ix0, iy1 - iy0
 
-    -- Mob centroid (used to pick the right map floor and for the readout).
+    -- Centroid of the PLOTTED points (used for the readout and, when we have no
+    -- chosen floor, to pick the centroid-nearest background map).
     local cx, cz = 0, 0
-    for _, p in ipairs(pts) do cx = cx + p.x; cz = cz + p.z end
-    cx = cx / #pts; cz = cz / #pts
+    for _, p in ipairs(drawPts) do cx = cx + p.x; cz = cz + p.z end
+    cx = cx / #drawPts; cz = cz / #drawPts
 
     -- Choose a world -> inner-screen transform and (optionally) a background
     -- image, in priority order:
-    --   1. LIVE client map for the floor that covers this mob (real calibration)
+    --   0. the floor chosen above from cached/native floor data (multi-floor)
+    --   1. LIVE client map for the floor that covers the centroid
     --   2. shipped/user PNG at maps/<image> with fitted calibration
     --   3. fitted-calibration grid    4. data-bounds grid
     local cal = zc.calibration
@@ -664,31 +1250,41 @@ local function DrawMobMap(zoneName, mobName)
     local bg_id           -- imgui texture id to draw as background, or nil
     local bg_is_live = false
 
-    local gm = gamemap and zc.zoneid and gamemap.get_best(zc.zoneid, cx, cz) or nil
-    if gm and gm.entry then
-        bg_id = gm.id
+    if selEntry then
+        bg_id = selTex
         bg_is_live = true
-        local e = gm.entry
+        local e = selEntry
         to_screen = function(wx, wz)
-            local rx, ry = gamemap.world_to_ref(e, wx, wz)  -- 0..512 ref space
+            local rx, ry = gamemap.world_to_ref(e, wx, wz)
             return ix0 + (rx / 512.0) * iw, iy0 + (ry / 512.0) * ih
         end
-    elseif cal and cal.referenceSize and cal.referenceSize > 0 then
-        local ref = cal.referenceSize
-        to_screen = function(wx, wz)
-            local tx = wx * cal.scalingX + cal.offsetX
-            local ty = wz * cal.scalingY + cal.offsetY
-            return ix0 + (tx / ref) * iw, iy0 + (ty / ref) * ih
-        end
     else
-        local b = zc.bounds
-        local dx = (b.max_x - b.min_x); local dz = (b.max_z - b.min_z)
-        if dx <= 0 or dz <= 0 then return false end
-        to_screen = function(wx, wz)
-            local u = (wx - b.min_x) / dx; local v = (wz - b.min_z) / dz
-            if u < 0 then u = 0 elseif u > 1 then u = 1 end
-            if v < 0 then v = 0 elseif v > 1 then v = 1 end
-            return ix0 + u * iw, iy0 + v * ih
+        local gm = gamemap and zc.zoneid and gamemap.get_best(zc.zoneid, cx, cz) or nil
+        if gm and gm.entry then
+            bg_id = gm.id
+            bg_is_live = true
+            local e = gm.entry
+            to_screen = function(wx, wz)
+                local rx, ry = gamemap.world_to_ref(e, wx, wz)  -- 0..512 ref space
+                return ix0 + (rx / 512.0) * iw, iy0 + (ry / 512.0) * ih
+            end
+        elseif cal and cal.referenceSize and cal.referenceSize > 0 then
+            local ref = cal.referenceSize
+            to_screen = function(wx, wz)
+                local tx = wx * cal.scalingX + cal.offsetX
+                local ty = wz * cal.scalingY + cal.offsetY
+                return ix0 + (tx / ref) * iw, iy0 + (ty / ref) * ih
+            end
+        else
+            local b = zc.bounds
+            local dx = (b.max_x - b.min_x); local dz = (b.max_z - b.min_z)
+            if dx <= 0 or dz <= 0 then return false end
+            to_screen = function(wx, wz)
+                local u = (wx - b.min_x) / dx; local v = (wz - b.min_z) / dz
+                if u < 0 then u = 0 elseif u > 1 then u = 1 end
+                if v < 0 then v = 0 elseif v > 1 then v = 1 end
+                return ix0 + u * iw, iy0 + v * ih
+            end
         end
     end
 
@@ -724,13 +1320,30 @@ local function DrawMobMap(zoneName, mobName)
     dl:AddText({ x0 + 4,  midy - 7 }, cmp, 'W')
 
     -- Markers: small red dots with a thin dark outline for contrast on the map.
-    for _, p in ipairs(pts) do
+    -- Points that transform outside the map area are dropped, not clamped.
+    for _, p in ipairs(drawPts) do
         local sx, sy = to_screen(p.x, p.z)
-        if sx < ix0 then sx = ix0 elseif sx > ix1 then sx = ix1 end
-        if sy < iy0 then sy = iy0 elseif sy > iy1 then sy = iy1 end
-        dl:AddCircleFilled({ sx, sy }, 2.2, u32(0.05, 0.02, 0.02, 0.85))  -- outline
-        dl:AddCircleFilled({ sx, sy }, 1.3, u32(0.95, 0.15, 0.15, 1.0))   -- red dot
+        if sx >= (ix0 - 3) and sx <= (ix1 + 3) and sy >= (iy0 - 3) and sy <= (iy1 + 3) then
+            dl:AddCircleFilled({ sx, sy }, 2.2, u32(0.05, 0.02, 0.02, 0.85))  -- outline
+            dl:AddCircleFilled({ sx, sy }, 1.3, u32(0.95, 0.15, 0.15, 1.0))   -- red dot
+        end
     end
+
+    -- Player marker. On a floor-filtered map, only show it when you're actually
+    -- on the floor being drawn (otherwise the dot would land on the wrong map).
+    local floorOk
+    if selFid ~= nil then
+        local pwx2, pwy2, pwh2 = GetPlayerPos()
+        local _, cz2 = GetCurrentZone()
+        if pwx2 and cz2 and Canon(cz2) == canon and gamemap and gamemap.get_floor_id then
+            local floors2 = ZoneFloors(canon)
+            local pf2 = floors2 and PickFloor(floors2, pwx2, pwy2, pwh2, gamemap.get_floor_id(pwx2, pwh2, pwy2))
+            floorOk = (pf2 and pf2.floorid == selFid) or false
+        else
+            floorOk = false
+        end
+    end
+    DrawPlayerMarker(dl, to_screen, ix0, iy0, ix1, iy1, zoneName, floorOk)
 
     imgui.PushStyleColor(ImGuiCol_Text, { 0.50, 0.54, 0.68, 1.0 })
     imgui.Text(('center ~ (%d, %d)%s'):format(
@@ -767,7 +1380,6 @@ local function DrawDetailPanel()
         :format(sel.fam or '\226\128\148', (sel.kind == 'Phys') and 'P' or 'M', sel.elem,
                 sel.lvl, MRL[sel.key] and tostring(MRL[sel.key]) or '?'))
     imgui.PopStyleColor(1)
-    imgui.Separator()
 
     local rows = LF.DATA[sel.key]
     if rows and #rows > 0 then
@@ -784,8 +1396,9 @@ local function DrawDetailPanel()
             imgui.Text(row[1]); imgui.NextColumn()
             imgui.PopStyleColor(1)
             -- Hover the monster name to see its spawn points on a mini-map
-            -- (only for zones we have position data for; West Ronfaure to start).
-            if imgui.IsItemHovered() and POS[row[3]] and POS[row[3]].mobs[row[1]] then
+            -- (only for zones/mobs we have position data for).
+            local dzc = POS[Canon(row[3])]
+            if imgui.IsItemHovered() and dzc and dzc.mobs[row[1]] then
                 imgui.BeginTooltip()
                 DrawMobMap(row[3], row[1])
                 imgui.EndTooltip()
@@ -811,6 +1424,296 @@ local function DrawDetailPanel()
 end
 
 -- =========================
+-- Zone map (Zone tab): a larger, always-on map for one whole zone. Plots the
+-- spawn points of a supplied set of mobs and, when you are standing in the
+-- zone, your live position.
+--
+-- Multi-floor zones (Giddeus, the Horutoto ruins, mine/citadel zones, ...) get
+-- ONE map per floor: points are assigned to the floor whose world rectangle
+-- contains them, and a floor selector lets you switch. This stops points from
+-- other floors piling onto a single floor's image. Outside the game (no live
+-- map), it falls back to a single fitted-calibration / data-bounds grid.
+--   zoneName : formatted zone name (a POS key and/or a ZONES value)
+--   mobNames : set { [mobName]=true } of mobs to plot (may be empty)
+-- Returns true if it drew a map surface.
+-- =========================
+
+-- Draw the map panel background (+ optional real map art), border, grid and
+-- compass. Returns the texture actually used (nil if the image failed).
+local function ZMapSurface(dl, x0, y0, x1, y1, ix0, iy0, ix1, iy1, iw, ih, tex)
+    dl:AddRectFilled({ x0, y0 }, { x1, y1 }, u32(0.07, 0.08, 0.12, 0.98), 6.0)
+    if tex then
+        local ok = pcall(function() dl:AddImage(tex, { ix0, iy0 }, { ix1, iy1 }) end)
+        if not ok then tex = nil end
+    end
+    dl:AddRect({ x0, y0 }, { x1, y1 }, u32(0.30, 0.36, 0.50, 0.9), 6.0)
+    local gcol = tex and u32(0.75, 0.80, 0.92, 0.10) or u32(0.20, 0.24, 0.34, 0.55)
+    local N = 8
+    for i = 0, N do
+        local gx = ix0 + iw * (i / N)
+        local gy = iy0 + ih * (i / N)
+        dl:AddLine({ gx, iy0 }, { gx, iy1 }, gcol, 1.0)
+        dl:AddLine({ ix0, gy }, { ix1, gy }, gcol, 1.0)
+    end
+    local cmp  = u32(0.60, 0.65, 0.80, 0.9)
+    local midx = (ix0 + ix1) * 0.5
+    local midy = (iy0 + iy1) * 0.5
+    dl:AddText({ midx - 4, y0 + 2 },  cmp, 'N')
+    dl:AddText({ midx - 4, y1 - 16 }, cmp, 'S')
+    dl:AddText({ x1 - 14, midy - 7 }, cmp, 'E')
+    dl:AddText({ x0 + 4,  midy - 7 }, cmp, 'W')
+    return tex
+end
+
+local function ZMapDots(dl, to_screen, ix0, iy0, ix1, iy1, pts)
+    -- Small margin so a point right on the edge still shows, but anything that
+    -- transforms outside this floor's map area is dropped rather than clamped to
+    -- the border (which is what produced dots "outside" the map).
+    local m = 3
+    for _, p in ipairs(pts) do
+        local sx, sy = to_screen(p.x, p.z)
+        if sx >= (ix0 - m) and sx <= (ix1 + m) and sy >= (iy0 - m) and sy <= (iy1 + m) then
+            dl:AddCircleFilled({ sx, sy }, 2.6, u32(0.05, 0.02, 0.02, 0.85))
+            dl:AddCircleFilled({ sx, sy }, 1.6, u32(0.95, 0.20, 0.20, 1.0))
+        end
+    end
+end
+
+-- Which floor (from a get_floors list) a world point belongs to: the containing
+-- rectangle with the smallest area, else the floor whose centre is nearest.
+-- (Defined once near the top of the module; see PickFloor there.)
+
+local function DrawZoneMap(zoneName, mobNames, bottomReserve)
+    local canon  = Canon(zoneName)
+    local zc     = POS[canon]
+    local zoneid = (zc and zc.zoneid) or ZONE_NAME_TO_ID[canon]
+
+    -- Available pane width (stable regardless of vertical position) for wrapping
+    -- the floor buttons. The map is sized just before it's drawn so it fills the
+    -- remaining width AND height of the pane (minus any reserved bottom area for
+    -- the mob table), so there's no wasted space.
+    local paneW = MAP_BASE_ZONE
+    do
+        local ok, w = pcall(function() return (imgui.GetContentRegionAvail()) end)
+        if ok and type(w) == 'number' and w > 0 then paneW = w end
+    end
+    local function MapDims()
+        local w, h = paneW, paneW
+        pcall(function()
+            local aw, ah = imgui.GetContentRegionAvail()
+            if type(aw) == 'number' then w = aw end
+            if type(ah) == 'number' then h = ah end
+        end)
+        local mw = math.floor(w - 2)
+        local mh = math.floor(h - (bottomReserve or 0) - 4)
+        if mw < 200 then mw = 200 end
+        if mh < 200 then mh = 200 end
+        return mw, mh
+    end
+
+    -- All requested points (world coords).
+    local allpts = {}
+    if zc and zc.mobs and mobNames then
+        for name in pairs(mobNames) do
+            local mp = zc.mobs[name]
+            if mp then for _, p in ipairs(mp) do allpts[#allpts + 1] = p end end
+        end
+    end
+
+    local pwx, pwy, pwh = GetPlayerPos()
+    local _, curZone = GetCurrentZone()
+    local inZone = pwx and curZone and Canon(curZone) == canon
+
+    local dl = imgui.GetWindowDrawList()
+
+    -- ---------- LIVE, PER-FLOOR PATH ----------
+    -- One assignment path for every zone shape. Each point is placed by
+    -- PickFloor: X/Z containment first (separates horizontally-split zones like
+    -- Kuftal, matching the hover maps' get_best), and only for floors that
+    -- OVERLAP in X/Z (vertical stacks) does it consult the game's floor function
+    -- (when we're in the zone) or learned height. The floors offered as buttons
+    -- are simply the ones points (or the player) actually land on.
+    local floors = ZoneFloors(canon)   -- all drawable floors, with height model
+    local byFloor, fnum, playerFloor
+
+    -- The game's floor function is exact but only answers for the zone we're in.
+    -- So when we ARE in this zone, capture the native floor of every spawn point
+    -- (once) -- then those authoritative ids are reused to place dots correctly
+    -- even when we later BROWSE this zone from somewhere else.
+    local useNative = NativeFloorsActive(canon)
+    if useNative then ScanZoneFloors(canon) end
+
+    if floors and #floors >= 1 then
+        local bucketsById, usedIds = {}, {}
+        for _, p in ipairs(allpts) do
+            local hint = NativeFloorOfPoint(p, useNative)   -- cached (any time) or live (in-zone)
+            local f = PickFloor(floors, p.x, p.z, p.y, hint)
+            if f then
+                usedIds[f.floorid] = true
+                bucketsById[f.floorid] = bucketsById[f.floorid] or {}
+                local t = bucketsById[f.floorid]; t[#t + 1] = p
+            end
+        end
+
+        local playerFid
+        if inZone then
+            local phint = useNative and gamemap.get_floor_id(pwx, pwh, pwy) or nil
+            local pf = PickFloor(floors, pwx, pwy, pwh, phint)
+            playerFid = pf and pf.floorid
+            if playerFid then usedIds[playerFid] = true end
+        end
+
+        -- Offer the floors that actually hold points or the player, renumbered
+        -- 0-based (contiguous) for the buttons.
+        local offer = {}
+        for _, f in ipairs(floors) do if usedIds[f.floorid] then offer[#offer + 1] = f end end
+        if #offer == 0 and floors[1] then offer[1] = floors[1] end
+
+        floors = offer
+        byFloor, fnum = {}, {}
+        for i, f in ipairs(floors) do
+            f.num = i - 1
+            byFloor[f.floorid] = bucketsById[f.floorid] or {}
+            fnum[f.floorid] = f.num
+            if playerFid == f.floorid then playerFloor = f end
+        end
+    end
+
+    if floors and #floors >= 1 then
+        -- Selected floor. A pinned floor (chosen from a floor button) wins and
+        -- is honoured even if empty. Otherwise auto-focus the floor with the
+        -- most points (or the player's), WITHOUT persisting it, so switching
+        -- spells keeps auto-focusing.
+        local pinned = zoneTabFloor[canon]
+        local sel
+        if pinned then
+            for _, f in ipairs(floors) do if f.floorid == pinned then sel = pinned break end end
+        end
+        if not sel then
+            local bestF, bestN
+            for _, f in ipairs(floors) do
+                local n = #byFloor[f.floorid]
+                if not bestN or n > bestN then bestF, bestN = f, n end
+            end
+            if (bestN or 0) == 0 and playerFloor then bestF = playerFloor end
+            sel = (bestF or floors[1]).floorid
+        end
+
+        -- Every offered floor is a button (they all hold points or the player).
+        local offer = floors
+
+        -- Floor selector (only when there's a choice). Wraps to fit the width.
+        if #offer > 1 then
+            local rowW = 0
+            for i, f in ipairs(offer) do
+                local isSel = (f.floorid == sel)
+                local isYou = (playerFloor and playerFloor.floorid == f.floorid)
+                local label = ('Floor %d (%d)%s'):format(fnum[f.floorid], #byFloor[f.floorid], isYou and ' *' or '')
+                local bw    = math.floor((imgui.CalcTextSize(label) or 40) + 14)
+                if i > 1 and (rowW + 4 + bw) <= paneW then
+                    imgui.SameLine(0, 4); rowW = rowW + 4 + bw
+                else
+                    rowW = bw
+                end
+                local bcol0 = isSel and { 0.30, 0.40, 0.62, 1.0 } or { 0.16, 0.18, 0.26, 1.0 }
+                local bcol1 = isSel and { 0.34, 0.45, 0.68, 1.0 } or { 0.24, 0.28, 0.42, 1.0 }
+                imgui.PushStyleColor(ImGuiCol_Button,        bcol0)
+                imgui.PushStyleColor(ImGuiCol_ButtonHovered, bcol1)
+                if imgui.Button(label .. '##zfloor_' .. tostring(f.floorid), { bw, 0 }) then
+                    sel = f.floorid; zoneTabFloor[canon] = sel   -- clicking pins the floor
+                end
+                imgui.PopStyleColor(2)
+                if imgui.IsItemHovered() then
+                    imgui.SetTooltip(('Floor %d  (client id %d) - %d spawn point%s%s'):format(
+                        fnum[f.floorid], f.floorid, #byFloor[f.floorid],
+                        (#byFloor[f.floorid] == 1) and '' or 's',
+                        isYou and '\nYou are on this floor' or ''))
+                end
+            end
+        end
+
+        -- Load the selected floor and draw it.
+        local fl = gamemap.get(zoneid, sel)
+        if fl and fl.entry then
+            local MAP_W, MAP_H = MapDims()
+            local ox, oy = imgui.GetCursorScreenPos()
+            imgui.Dummy({ MAP_W, MAP_H })
+            local x0, y0   = ox, oy
+            local x1, y1   = ox + MAP_W, oy + MAP_H
+            local ix0, iy0 = x0 + MAP_PAD, y0 + MAP_PAD
+            local ix1, iy1 = x1 - MAP_PAD, y1 - MAP_PAD
+            local iw, ih   = ix1 - ix0, iy1 - iy0
+
+            ZMapSurface(dl, x0, y0, x1, y1, ix0, iy0, ix1, iy1, iw, ih, fl.id)
+
+            local e = fl.entry
+            local to_screen = function(wx, wz)
+                local rx, ry = gamemap.world_to_ref(e, wx, wz)
+                return ix0 + (rx / 512.0) * iw, iy0 + (ry / 512.0) * ih
+            end
+
+            local fpts = byFloor[sel] or {}
+            ZMapDots(dl, to_screen, ix0, iy0, ix1, iy1, fpts)
+
+            local floorOk = (playerFloor and playerFloor.floorid == sel) or nil
+            if playerFloor and playerFloor.floorid ~= sel then floorOk = false end
+            DrawPlayerMarker(dl, to_screen, ix0, iy0, ix1, iy1, zoneName, floorOk)
+            return true
+        end
+        -- Live floor failed to load: fall through to the single-plane path.
+    end
+
+    -- ---------- SINGLE-PLANE FALLBACK (no live map) ----------
+    -- Pick a transform: fitted calibration, else data-bounds grid.
+    local pts = allpts
+    local MAP_W, MAP_H = MapDims()
+    local ox, oy = imgui.GetCursorScreenPos()
+    imgui.Dummy({ MAP_W, MAP_H })
+    local x0, y0   = ox, oy
+    local x1, y1   = ox + MAP_W, oy + MAP_H
+    local ix0, iy0 = x0 + MAP_PAD, y0 + MAP_PAD
+    local ix1, iy1 = x1 - MAP_PAD, y1 - MAP_PAD
+    local iw, ih   = ix1 - ix0, iy1 - iy0
+
+    local cal = zc and zc.calibration
+    local to_screen
+    if cal and cal.referenceSize and cal.referenceSize > 0 then
+        local ref = cal.referenceSize
+        to_screen = function(wx, wz)
+            local tx = wx * cal.scalingX + cal.offsetX
+            local ty = wz * cal.scalingY + cal.offsetY
+            return ix0 + (tx / ref) * iw, iy0 + (ty / ref) * ih
+        end
+    elseif zc and zc.bounds then
+        local b = zc.bounds
+        local dx = (b.max_x - b.min_x); local dz = (b.max_z - b.min_z)
+        if dx > 0 and dz > 0 then
+            to_screen = function(wx, wz)
+                local u = (wx - b.min_x) / dx; local v = (wz - b.min_z) / dz
+                if u < 0 then u = 0 elseif u > 1 then u = 1 end
+                if v < 0 then v = 0 elseif v > 1 then v = 1 end
+                return ix0 + u * iw, iy0 + v * ih
+            end
+        end
+    end
+
+    local tex = cal and load_map_texture(cal.image) or nil
+    tex = ZMapSurface(dl, x0, y0, x1, y1, ix0, iy0, ix1, iy1, iw, ih, tex)
+
+    if not to_screen then
+        imgui.PushStyleColor(ImGuiCol_Text, { 0.60, 0.63, 0.78, 1.0 })
+        imgui.Text('No map data available for this zone yet.');
+        imgui.Text('Visit Zone to Populate Correct Spawn Locations.')
+        imgui.PopStyleColor(1)
+        return false
+    end
+
+    ZMapDots(dl, to_screen, ix0, iy0, ix1, iy1, pts)
+    DrawPlayerMarker(dl, to_screen, ix0, iy0, ix1, iy1, zoneName)
+    return true
+end
+
+-- =========================
 -- Module API
 -- =========================
 function M.init(host)
@@ -819,6 +1722,10 @@ function M.init(host)
     settings    = host.settings
     helpers     = host.helpers
     default_cfg = host.default_config
+
+    -- Apply any native map-floor assignments captured in previous sessions so
+    -- browsing those zones is immediately correct.
+    HydrateFloorCache()
 
     -- Bind the learned subtable (settings.load already merged defaults).
     if not cfg.bluemage_data then cfg.bluemage_data = M.default_data end
@@ -939,7 +1846,8 @@ local function TrackerEntry(r, bluLvl, skill, mobs, show_zone, zone_name)
             imgui.PopStyleColor(1)
             do  -- hover the mob name for its spawn mini-map
                 local zn = m[3] or zone_name
-                if imgui.IsItemHovered() and zn and POS[zn] and POS[zn].mobs[m[1]] then
+                local hzc = zn and POS[Canon(zn)]
+                if imgui.IsItemHovered() and hzc and hzc.mobs[m[1]] then
                     imgui.BeginTooltip(); DrawMobMap(zn, m[1]); imgui.EndTooltip()
                 end
             end
@@ -960,7 +1868,8 @@ local function TrackerEntry(r, bluLvl, skill, mobs, show_zone, zone_name)
             imgui.PopStyleColor(1)
             do  -- hover the mob name for its spawn mini-map
                 local zn = m[3] or zone_name
-                if imgui.IsItemHovered() and zn and POS[zn] and POS[zn].mobs[m[1]] then
+                local hzc = zn and POS[Canon(zn)]
+                if imgui.IsItemHovered() and hzc and hzc.mobs[m[1]] then
                     imgui.BeginTooltip(); DrawMobMap(zn, m[1]); imgui.EndTooltip()
                 end
             end
@@ -1063,6 +1972,255 @@ local function RenderTracker()
 end
 
 -- =========================
+-- Zone tab (in-window): pick any zone and see which Blue Magic can be learned
+-- there, with a scalable zone map that shows the mob spawns and your live
+-- position when you're standing in that zone.
+-- =========================
+local function RenderZoneTab()
+    -- Default the picker to the player's current zone the first time in.
+    if not zoneTabZone then
+        local _, zn = GetCurrentZone()
+        if zn then zoneTabZone = zn end
+    end
+
+    -- While standing in a zone, capture its spawn points' native floors (once),
+    -- even if the list is showing a different zone -- so browsing this zone later
+    -- places dots on the correct floors.
+    do
+        local _, cz = GetCurrentZone()
+        if cz and gamemap and gamemap.floor_id_available and gamemap.floor_id_available() then
+            ScanZoneFloors(Canon(cz))
+        end
+    end
+
+    -- Helper: point the tab at a zone (+ optional pinned floor).
+    local function selectZoneFloor(zone, floorid)
+        zoneTabZone = zone
+        zoneTabFloor[zone] = floorid   -- nil = auto-focus (buttons pin a floor)
+        zoneTabSpellKey = nil
+    end
+
+    imgui.PushStyleColor(ImGuiCol_Text, { 0.80, 0.90, 1.00, 1.0 })
+    imgui.Text('Search Blue Magic by zone')
+    imgui.PopStyleColor(1)
+
+    -- ---- Zone picker: click the dropdown and just start typing to filter.
+    -- The filter lives inside the dropdown and grabs focus on open. No inner
+    -- scroll child, so the dropdown has a single scrollbar. ----
+    local comboFlags = (type(ImGuiComboFlags_HeightLarge) == 'number') and ImGuiComboFlags_HeightLarge or 0
+    imgui.SetNextItemWidth(260)
+    if imgui.BeginCombo('##bm_zone_pick', CurrentZoneLabel(), comboFlags) then
+        local appearing = imgui.IsWindowAppearing()
+        if appearing then zoneTabSearch[1] = '' end       -- fresh filter each open
+        imgui.SetNextItemWidth(244)
+        if appearing then pcall(function() imgui.SetKeyboardFocusHere(0) end) end
+        pcall(function() imgui.InputText('##bm_zone_filter', zoneTabSearch, 64) end)
+        imgui.Separator()
+        local needle = (zoneTabSearch[1] or ''):lower()
+        for _, zn in ipairs(ZONE_LIST) do
+            if needle == '' or zn:lower():find(needle, 1, true) then
+                if imgui.Selectable(zn .. '##zpick', zoneTabZone == zn) then
+                    selectZoneFloor(zn, nil)   -- auto-focus; buttons switch floors
+                end
+            end
+        end
+        imgui.EndCombo()
+    end
+    imgui.SameLine(0, 8)
+    imgui.PushStyleColor(ImGuiCol_Button,        { 0.18, 0.24, 0.34, 1.0 })
+    imgui.PushStyleColor(ImGuiCol_ButtonHovered, { 0.24, 0.32, 0.46, 1.0 })
+    if imgui.Button('Current zone') then
+        local _, zn = GetCurrentZone()
+        if zn then
+            -- Pin to the floor the player is actually on, when we can tell.
+            local canon = Canon(zn)
+            local floorid
+            local floors = ZoneFloors(canon)
+            local pwx, pwy, pwh = GetPlayerPos()
+            if floors and #floors > 1 and pwx then
+                if NativeFloorsActive(canon) then
+                    local nf = gamemap.get_floor_id(pwx, pwh, pwy)
+                    for _, f in ipairs(floors) do if f.floorid == nf then floorid = nf break end end
+                end
+                if not floorid then
+                    local pf = PickFloor(floors, pwx, pwy, pwh)
+                    floorid = pf and pf.floorid or nil
+                end
+            end
+            selectZoneFloor(zn, floorid)
+        end
+    end
+    imgui.PopStyleColor(2)
+    if imgui.IsItemHovered() then imgui.SetTooltip('Jump to the zone (and floor) you are standing in.') end
+    imgui.SameLine(0, 12)
+    local zhl = { zoneTabHideLearned[1] }
+    if imgui.Checkbox('Hide learned##zone', zhl) then zoneTabHideLearned[1] = zhl[1] end
+
+    imgui.Separator()
+
+    if not zoneTabZone then
+        imgui.PushStyleColor(ImGuiCol_Text, { 0.55, 0.58, 0.72, 1.0 })
+        imgui.Text('Pick a zone to see which Blue Magic you can learn there.')
+        imgui.PopStyleColor(1)
+        return
+    end
+
+    -- Zone (+ floor) name + "you are here" hint.
+    local _, curZone = GetCurrentZone()
+    imgui.PushStyleColor(ImGuiCol_Text, { 0.72, 0.82, 0.72, 1.0 })
+    imgui.Text(CurrentZoneLabel())
+    imgui.PopStyleColor(1)
+    if curZone and Canon(curZone) == Canon(zoneTabZone) then
+        imgui.SameLine(0, 8)
+        imgui.PushStyleColor(ImGuiCol_Text, { 0.55, 0.85, 1.00, 1.0 })
+        imgui.Text('(you are here)')
+        imgui.PopStyleColor(1)
+    end
+
+    local bluLvl = GetBluLevel()
+    local skill  = GetBlueSkill()
+    local list   = AllSpellsInZone(zoneTabZone, zoneTabHideLearned[1])
+
+    -- Split body: spell list on the left, zone map on the right. Size the body
+    -- to the ACTUAL remaining height in the window so it fills to the bottom --
+    -- no wasted footer strip.
+    local bodyH = (WINDOW_HEIGHT - 176)
+    do
+        local ok, _, h = pcall(function() return imgui.GetContentRegionAvail() end)
+        if ok and type(h) == 'number' and h > 0 then bodyH = h end
+    end
+    if bodyH < 120 then bodyH = 120 end
+    local LEFT_W = 270
+
+    imgui.BeginChild('##bm_zone_list', { LEFT_W, bodyH })
+    if #list == 0 then
+        imgui.PushStyleColor(ImGuiCol_Text, { 0.55, 0.58, 0.72, 1.0 })
+        imgui.Text('No Blue Magic is learnable here')
+        imgui.Text('(with the current filters).')
+        imgui.PopStyleColor(1)
+    else
+        for _, item in ipairs(list) do
+            local r      = item.rec
+            local isL    = learned[r.key] and true or false
+            local status = LearnStatus(r.key, bluLvl, skill)
+            local label  = ('Lv%02d  %s%s'):format(r.lvl, r.name, isL and '  [X]' or '')
+            imgui.PushStyleColor(ImGuiCol_Text, STATUS_COL[status] or { 0.82, 0.85, 0.94, 1.0 })
+            if imgui.Selectable(label .. '##zsp_' .. r.key, zoneTabSpellKey == r.key) then
+                zoneTabSpellKey = (zoneTabSpellKey == r.key) and nil or r.key
+            end
+            imgui.PopStyleColor(1)
+            if imgui.IsItemHovered() then
+                imgui.SetTooltip(isL and 'Already learned - click to map its mobs here'
+                                      or 'Click to map where to learn this in ' .. zoneTabZone)
+            end
+        end
+    end
+    imgui.EndChild()
+
+    imgui.SameLine(0, 8)
+
+    imgui.BeginChild('##bm_zone_map_pane', { 0, bodyH })
+    -- Build the mob set to plot: the selected spell's mobs here, else every
+    -- learnable spell's mobs in this zone.
+    local mobNames = {}
+    local selRec
+    if zoneTabSpellKey then
+        for _, item in ipairs(list) do
+            if item.rec.key == zoneTabSpellKey then
+                selRec = item.rec
+                for _, m in ipairs(item.mobs) do mobNames[m[1]] = true end
+                break
+            end
+        end
+        if not selRec then zoneTabSpellKey = nil end
+    end
+    if not zoneTabSpellKey then
+        for _, item in ipairs(list) do
+            for _, m in ipairs(item.mobs) do mobNames[m[1]] = true end
+        end
+    end
+
+    -- Red warning above everything when this multi-floor zone isn't cached yet.
+    if not ZoneFloorsTrusted(Canon(zoneTabZone)) then
+        imgui.PushStyleColor(ImGuiCol_Text, { 0.95, 0.35, 0.30, 1.0 })
+        imgui.TextWrapped('Map Data Not Cached Yet - Spawn Locations May Be Incorrect')
+        imgui.TextWrapped('Visit Zone to Cache Correct Spawn Locations')
+        imgui.PopStyleColor(1)
+    end
+
+    -- Mob list rows: the selected spell's mobs, or (when nothing is selected)
+    -- every learnable-spell mob in the zone, deduped.
+    local rows = {}
+    if selRec then
+        for _, item in ipairs(list) do
+            if item.rec.key == selRec.key then
+                for _, m in ipairs(item.mobs) do rows[#rows + 1] = m end
+            end
+        end
+    else
+        local seen = {}
+        for _, item in ipairs(list) do
+            for _, m in ipairs(item.mobs) do
+                if not seen[m[1]] then seen[m[1]] = true; rows[#rows + 1] = m end
+            end
+        end
+    end
+    table.sort(rows, function(a, b) return a[1] < b[1] end)
+
+    -- Reserve a FIXED portion of the pane for the mob list -- ALWAYS, whether or
+    -- not a spell is selected -- so the map's size depends only on the window
+    -- size (which persists when you resize it) and never jumps when you switch
+    -- zone, floor, or spell. The list scrolls if it's long.
+    local reserve
+    do
+        local availH = 300
+        pcall(function() local _, h = imgui.GetContentRegionAvail(); if type(h) == 'number' then availH = h end end)
+        reserve = math.floor(availH * 0.34)
+        if reserve < 120 then reserve = 120 elseif reserve > 300 then reserve = 300 end
+    end
+
+    DrawZoneMap(zoneTabZone, mobNames, reserve)
+
+    -- Divider under the map: a line drawn in the map panel's own background
+    -- colour (same { 0.07, 0.08, 0.12 } navy used for the map fill).
+    do
+        imgui.Dummy({ 0, 3 })
+        local dl = imgui.GetWindowDrawList()
+        local x, y = imgui.GetCursorScreenPos()
+        local w = 300
+        pcall(function() local aw = imgui.GetContentRegionAvail(); if type(aw) == 'number' and aw > 0 then w = aw end end)
+        dl:AddLine({ x, y }, { x + w, y }, u32(0.07, 0.08, 0.12, 0.98), 6)
+        imgui.Dummy({ 0, 6 })
+    end
+    local zcMobs = (POS[Canon(zoneTabZone)] or {}).mobs or {}
+    -- Transparent child background so the child's own fill rect doesn't paint a
+    -- faint 1px seam at its top edge (which read as a thin line above the
+    -- Monster/Level header). Scrolling is unaffected.
+    imgui.PushStyleColor(ImGuiCol_ChildBg, { 0, 0, 0, 0 })
+    imgui.BeginChild('##bm_zone_mobtable', { 0, 0 })
+    imgui.Columns(2, '##bm_zone_mobs', false)
+    imgui.SetColumnWidth(0, 190)
+    imgui.PushStyleColor(ImGuiCol_Text, { 0.60, 0.63, 0.78, 1.0 })
+    imgui.Text('Monster'); imgui.NextColumn()
+    imgui.Text('Level');   imgui.NextColumn()
+    imgui.PopStyleColor(1)
+    for _, m in ipairs(rows) do
+        local hasPos = zcMobs[m[1]] ~= nil
+        imgui.PushStyleColor(ImGuiCol_Text, hasPos and { 0.82, 0.85, 0.94, 1.0 }
+                                                    or  { 0.55, 0.58, 0.70, 1.0 })
+        imgui.Text(m[1] .. (hasPos and '' or '  (no map)')); imgui.NextColumn()
+        imgui.PopStyleColor(1)
+        imgui.PushStyleColor(ImGuiCol_Text, { 0.70, 0.73, 0.85, 1.0 })
+        imgui.Text(m[2]); imgui.NextColumn()
+        imgui.PopStyleColor(1)
+    end
+    imgui.Columns(1)
+    imgui.EndChild()
+    imgui.PopStyleColor(1)
+    imgui.EndChild()
+end
+
+-- =========================
 -- Settings tab (in-window config UI). Ported from the old Codex config
 -- tab; the cross-module "Copy to all" and dispatcher kill-switch were
 -- dropped since this is a standalone, single-window addon.
@@ -1160,6 +2318,31 @@ local function RenderConfigTab()
 
     imgui.Separator()
 
+    -- ================= Spawn maps (mini-map + Zone tab) =================
+    imgui.PushStyleColor(ImGuiCol_Text, { 0.75, 0.78, 0.90, 1.0 })
+    imgui.Text('Spawn Maps:')
+    imgui.PopStyleColor(1)
+
+    imgui.PushItemWidth(200)
+    local ms = { cfg.bluemage_map_scale or 1.0 }
+    if imgui.SliderFloat('Map scale##bluemage', ms, 0.5, 3.0, '%.2fx') then
+        cfg.bluemage_map_scale = ms[1]; settings.save()
+    end
+    if imgui.IsItemHovered() then
+        imgui.SetTooltip('Size of the hover mini-maps (Spells / Tracker).\nThe Zone tab map has its own fixed size.')
+    end
+    imgui.PopItemWidth()
+
+    local sp = { cfg.bluemage_show_player ~= false }
+    if imgui.Checkbox('Show player marker##bluemage', sp) then
+        cfg.bluemage_show_player = sp[1]; settings.save()
+    end
+    if imgui.IsItemHovered() then
+        imgui.SetTooltip('Plot a marker at your live position on the map,\nbut only while you are standing in that zone.')
+    end
+
+    imgui.Separator()
+
     -- Reset window settings (learned checkmarks come from the spellbook).
     imgui.PushStyleColor(ImGuiCol_Button,        { 0.20, 0.18, 0.28, 1.0 })
     imgui.PushStyleColor(ImGuiCol_ButtonHovered, { 0.30, 0.28, 0.42, 1.0 })
@@ -1200,6 +2383,20 @@ function M.render()
             SyncFromSpellbook()
         end
     end
+
+    -- Capture the game's exact map-floor for the zone you're standing in (once),
+    -- automatically -- no need to open the Zone tab. Near-free after the first
+    -- successful capture per zone (ScanZoneFloors early-outs once cached).
+    pcall(function()
+        local _, cz = GetCurrentZone()
+        if cz then
+            local canon = Canon(cz)
+            if not nativeScanned[canon]
+               and gamemap and gamemap.floor_id_available and gamemap.floor_id_available() then
+                ScanZoneFloors(canon)
+            end
+        end
+    end)
 
     -- The separate tracker window renders independently of the main window
     -- (it shows whenever the track mode is not 'off').
@@ -1374,6 +2571,12 @@ function M.render()
         imgui.EndTabItem()
     end  -- Spells tab
 
+    -- Zones tab: search Blue Magic by zone, with a scalable map + player marker.
+    if imgui.BeginTabItem('Zones') then
+        RenderZoneTab()
+        imgui.EndTabItem()
+    end
+
     -- Settings tab. The gear / "/blutracker config" set vt._want_settings_tab so we
     -- programmatically select it here on the next frame.
     local set_flags = 0
@@ -1427,6 +2630,8 @@ function M.command(e)
             if vt and vt.cfg_bluemage_open then vt.cfg_bluemage_open[1] = cfg.bluemage_open end
             if vt then vt._want_settings_tab = true end
             settings.save()
+        elseif a[2] == 'floors' then
+            M.debug_floors()
         else
             cfg.bluemage_open = not cfg.bluemage_open
             if vt and vt.cfg_bluemage_open then vt.cfg_bluemage_open[1] = cfg.bluemage_open end
@@ -1435,6 +2640,57 @@ function M.command(e)
         return true
     end
     return false
+end
+
+-- Diagnostic: print the current zone's map-floor geometry and how the currently
+-- selected Zone-tab spell's spawn points get assigned. Helps pin down misplaced
+-- dots on multi-map zones. Usage: /blutracker floors  (while standing in the
+-- zone you're viewing on the Zone tab).
+function M.debug_floors()
+    local zid, zname = GetCurrentZone()
+    local zoneName = zoneTabZone or zname
+    print(('[BluTracker] floor debug for "%s" (current zone: %s / id %s)')
+        :format(tostring(zoneName), tostring(zname), tostring(zid)))
+    if not zoneName then return end
+    local canon  = Canon(zoneName)
+    local zoneid = ZoneIdOf(canon)
+    local native = (gamemap and gamemap.floor_id_available and gamemap.floor_id_available()) and 'YES' or 'no'
+    print(('  zoneid=%s  native floor fn: %s  in-zone: %s')
+        :format(tostring(zoneid), native, tostring(zname and Canon(zname) == canon)))
+
+    local floors = ZoneFloors(canon)
+    if not floors then print('  (no live floor data - are you in game?)'); return end
+    for _, f in ipairs(floors) do
+        local b = f.bounds
+        print(('  floor id %-3d  bounds x[%.0f..%.0f] z[%.0f..%.0f]  medY=%s')
+            :format(f.floorid, b.minX, b.maxX, b.minZ, b.maxZ, tostring(f.medY)))
+    end
+
+    -- Selected spell's mobs, or all learnable if none selected.
+    local zc = POS[canon]
+    if not (zc and zc.mobs) then print('  (no spawn data for this zone)'); return end
+    local mobset = {}
+    if zoneTabSpellKey and LF.DATA[zoneTabSpellKey] then
+        for _, row in ipairs(LF.DATA[zoneTabSpellKey]) do
+            if Canon(row[3]) == canon then mobset[row[1]] = true end
+        end
+        print('  spell: ' .. tostring(zoneTabSpellKey))
+    else
+        print('  (no spell selected - showing nothing; select a spell first)')
+        return
+    end
+    local inZone = zname and Canon(zname) == canon
+    for name in pairs(mobset) do
+        local pts = zc.mobs[name]
+        if pts then
+            for _, p in ipairs(pts) do
+                local hint = inZone and gamemap.get_floor_id and gamemap.get_floor_id(p.x, p.y, p.z) or nil
+                local f = PickFloor(floors, p.x, p.z, p.y, hint)
+                print(('    %-18s x=%7.1f h=%6.1f z=%7.1f  -> floor %s  (native=%s)')
+                    :format(name, p.x, p.y, p.z, f and tostring(f.floorid) or '?', tostring(hint)))
+            end
+        end
+    end
 end
 
 -- Fallback only. When the spellbook read works it is authoritative and this
@@ -1482,6 +2738,8 @@ function M.reset_settings(default_config)
     cfg.bluemage_auto_learn    = default_config.bluemage_auto_learn
     cfg.bluemage_hide_learned  = default_config.bluemage_hide_learned
     cfg.bluemage_only_my_level = default_config.bluemage_only_my_level
+    cfg.bluemage_map_scale       = default_config.bluemage_map_scale
+    cfg.bluemage_show_player     = default_config.bluemage_show_player
     cfg.bluemage_track_mode    = default_config.bluemage_track_mode
     cfg.bluemage_bg_color_r    = default_config.bluemage_bg_color_r
     cfg.bluemage_bg_color_g    = default_config.bluemage_bg_color_g

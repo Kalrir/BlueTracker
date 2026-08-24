@@ -13,6 +13,7 @@
 *   /blutracker                toggle the Blue Magic window
 *   /blutracker config         open the window on its Settings tab (or: settings)
 *   /blutracker test [spell]   preview the "Action Learned!" splash
+*   /blutracker floors         print map-floor diagnostics for the current zone
 *
 * Per-character state (learned spells, tracked spells, window options) is
 * saved by Ashita's settings library, so each character keeps its own data.
@@ -20,7 +21,7 @@
 
 addon.name    = 'BluTracker';
 addon.author  = 'Kalrir';
-addon.version = '1.01';
+addon.version = '1.10';
 addon.desc    = 'Blue Magic spell-learning tracker with a where-to-learn guide.';
 
 require('common');
@@ -45,6 +46,10 @@ local default_config = T{
     bluemage_auto_learn    = true,   -- chat fallback when the spellbook read is unavailable
     bluemage_hide_learned  = false,  -- filter: hide already-learned spells
     bluemage_only_my_level = false,  -- filter: only spells at/below your BLU level
+    -- Mini-map / zone-map options
+    bluemage_map_scale       = 1.0,   -- size multiplier for the hover mini-maps
+    bluemage_show_player     = true,  -- draw a marker at the player's live position
+    bluemage_floorcache_str  = '',    -- persisted native map-floor cache (self-encoded)
     bluemage_bg_color_r    = 0.06,
     bluemage_bg_color_g    = 0.07,
     bluemage_bg_color_b    = 0.10,

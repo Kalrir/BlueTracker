@@ -342,4 +342,95 @@ function gamemap.available()
     return ok_ffi and mem ~= nil
 end
 
+-- ---------------------------------------------------------------------------
+-- Native floor detection. The FFXI client has a function that returns the map
+-- floor id for a world position using the loaded zone's own (per-zone) height
+-- logic. Reading it is the only accurate way to place a point on a vertically
+-- stacked floor. It only works for the zone the player is currently in (it runs
+-- against the loaded zone-map object). Signatures are community reverse-
+-- engineering (atom0s/Thorny; used by the Boussole project). Fully guarded: any
+-- failure returns nil and callers fall back to the heuristic.
+--
+-- IMPORTANT: coordinates are passed in server order (x, y=height, z=depth); the
+-- client entry point takes them in that order.
+-- ---------------------------------------------------------------------------
+local FLOOR_FUNC_SIG = '8B542408568D4424108BF18B4C2410508B44240C'
+local FLOOR_THIS_SIG = '8B7424148B4424108B7C240C8B0D'
+local floor_cdef_ok  = false
+local floor_func     = nil   -- ffi function pointer
+local floor_this_ptr = 0     -- address holding pointer-to-pointer of zone map obj
+local floor_scanned  = false
+
+local function ensure_floor_cdef()
+    if floor_cdef_ok or not ok_ffi then return floor_cdef_ok end
+    floor_cdef_ok = pcall(function()
+        ffi.cdef[[
+            typedef int32_t (__thiscall* BM_CheckFloorNumber_f)(void* pThis, float X, float Y, float Z);
+        ]]
+    end)
+    return floor_cdef_ok
+end
+
+local function find_floor_func()
+    if floor_scanned then return floor_func ~= nil and floor_this_ptr ~= 0 end
+    floor_scanned = true
+    if not ok_ffi or not mem or not mem.find then return false end
+    if not ensure_floor_cdef() then return false end
+    pcall(function()
+        local fa = mem.find('FFXiMain.dll', 0, FLOOR_FUNC_SIG, 0, 0)
+        local ta = mem.find('FFXiMain.dll', 0, FLOOR_THIS_SIG, 0x0E, 0)
+        if not fa or fa == 0 or not ta or ta == 0 then return end
+        floor_func     = ffi.cast('BM_CheckFloorNumber_f', fa)
+        floor_this_ptr = ta
+    end)
+    return floor_func ~= nil and floor_this_ptr ~= 0
+end
+
+function gamemap.floor_id_available()
+    return find_floor_func()
+end
+
+-- Return the client's floor id for a world position in the CURRENT zone, or nil.
+-- Coords are server order: wx = pos_x, wy = pos_y (height), wz = pos_z (depth).
+function gamemap.get_floor_id(wx, wy, wz)
+    if not find_floor_func() then return nil end
+    local res
+    local ok = pcall(function()
+        local pp = mem.read_uint32(floor_this_ptr)
+        if not pp or pp == 0 then return end
+        local this_val = mem.read_uint32(pp)
+        if not this_val or this_val == 0 then return end
+        local this_obj = ffi.cast('void*', this_val)
+        if this_obj == nil then return end
+        res = floor_func(this_obj, wx, wy, wz)
+    end)
+    if ok and res ~= nil then return tonumber(res) end
+    return nil
+end
+
+-- Public: list a zone's loadable map floors with their world coverage. Used by
+-- callers that want to split points across floors themselves (e.g. plotting a
+-- whole zone). Returns an array of { floorid, index, bounds = {minX,maxX,
+-- minZ,maxZ} }, sorted by floorid, or nil if unavailable (e.g. outside game).
+function gamemap.get_floors(zoneid)
+    local zi = ZONE_INDEX[zoneid]
+    if not zi then return nil end
+    local ok, res = pcall(function()
+        if not ok_ffi or not find_table() then return nil end
+        local out = {}
+        for floorid, index in pairs(zi) do
+            local entry = read_entry(index)
+            if entry and math.abs(entry.Scale or 0) ~= 0 then
+                local b = entry_world_bounds(entry)
+                if b then
+                    out[#out + 1] = { floorid = floorid, index = index, bounds = b }
+                end
+            end
+        end
+        table.sort(out, function(a, b) return a.floorid < b.floorid end)
+        return out
+    end)
+    return (ok and res) or nil
+end
+
 return gamemap

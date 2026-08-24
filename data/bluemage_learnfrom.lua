@@ -326,6 +326,9 @@ M.DATA = {
         { "Wicked Dahak", "75", "Wajaom Woodlands" },
     },
     ["bombtoss"] = {
+        { "Goblin Gambler", "27-30", "Lower Delkfutts Tower" },
+        { "Goblin Leecher", "27-30", "Lower Delkfutts Tower" },
+        { "Goblin Mugger", "27-30", "Lower Delkfutts Tower" },
         { "Goblin Thug", "1-6", "Inner Horutoto Ruins" },
         { "Goblin Fisher", "3-4", "West Sarutabaruta" },
         { "Goblin Fisher", "3-5", "South Gustaberg" },
@@ -1134,6 +1137,7 @@ M.DATA = {
         { "Bane Lizard", "47-49", "Attohwa Chasm" },
     },
     ["jetstream"] = {
+        { "Seeker Bats", "25-27", "Lower Delkfutts Tower" },
         { "Ding Bats", "1-2", "Zeruhn Mines" },
         { "Battue Bats", "1-3", "Inner Horutoto Ruins" },
         { "Ding Bats", "1-5", "East Ronfaure" },
