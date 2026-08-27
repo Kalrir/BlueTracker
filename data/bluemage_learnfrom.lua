@@ -3,7 +3,7 @@
 *
 * key (matches data/bluemage_spells.lua keyify) -> { { monster, level, zone }, ... }
 *
-* SOURCE: derived from the LandSandBoat server database (the same data
+* SOURCE: derived from the LandSandBoat server database (the same lineage
 * HorizonXI is built on) by joining blue_spell_list -> mob_skill_lists
 * -> mob_pools -> mob_groups -> mob_spawn_points. See tools/build_lf.py.
 *
@@ -20,10 +20,19 @@
 *
 * Venom Shell and Cold Wave (whose only vanilla-LSB sources are post-era) are
 * filled from the era-matched Classic FFXI wiki.
+*
+* SEA / AHT URHGAN BACKFILL: the reduced LSB "base" spawn tables omit the
+* Al'Taieu / Grand Palace / Garden of Ru'Hmet (Sea) and several Aht Urhgan
+* zones, so the "empty" families that teach the level 72-75 spells were
+* missing. Those sources (Aern, Xzomit, Hpemde, Zdei, Ghrah, Euvhi, Phuabo,
+* Soulflayer, ...) were backfilled from the era-locked AirSkyBoat spawn data,
+* which shares the same DarkStar mob/skill lineage. Existing entries were
+* preserved; only genuinely-absent sources were added (24-source cap kept).
 --]]
 
 local M = {}
 M.DATA = {
+
     ["1000needles"] = {
         { "Sabotender", "42-46", "Eastern Altepa Desert" },
         { "Cactuar", "48-53", "Western Altepa Desert" },
@@ -46,6 +55,12 @@ M.DATA = {
     },
     ["actinicburst"] = {
         { "Jailer of Fortitude", "75", "The Garden of RuHmet" },
+        { "Eo'ghrah", "75", "Grand Palace of HuXzoi" },
+        { "Ix'ghrah", "75", "Grand Palace of HuXzoi" },
+        { "Pyrrha", "75", "Temenos" },
+        { "Temenos Ghrah", "75", "Temenos" },
+        { "Aw'ghrah", "75", "The Garden of RuHmet" },
+        { "Kf'ghrah", "75", "The Garden of RuHmet" },
     },
     ["amplification"] = {
         { "Pudding Master", "50", "Navukgo Execution Chamber" },
@@ -106,6 +121,7 @@ M.DATA = {
         { "Nightmare Bugard", "75", "Dynamis-Tavnazia" },
         { "Slackjawed Mukdrom", "75", "Beaucedine Glacier" },
         { "Tyrannobugard", "75", "Mamook" },
+        { "Apollyon Scavenger", "75", "Apollyon" },
     },
     ["badbreath"] = {
         { "Malboro", "27-28", "Pashhow Marshlands" },
@@ -177,6 +193,8 @@ M.DATA = {
         { "Bullbeggar", "75", "Den of Rancor" },
         { "Mischievous Micholas", "75", "Nyzul Isle" },
         { "Natty Gibbon", "75", "Dangruf Wadi" },
+        { "Arboricole Opo-opo", "75", "Apollyon" },
+        { "Kerkopes", "75", "Apollyon" },
     },
     ["blastbomb"] = {
         { "Orcish Stonelauncher", "8-10", "Ghelsba Outpost" },
@@ -592,7 +610,13 @@ M.DATA = {
         { "Borealis Shadow", "75", "Fei'Yin" },
     },
     ["disseverment"] = {
+        { "Ru'aern", "70-71", "AlTaieu" },
+        { "Ul'aern", "70-73", "AlTaieu" },
         { "Absolute Virtue", "75", "AlTaieu" },
+        { "Om'aern", "75", "AlTaieu" },
+        { "Eo'aern", "75", "Grand Palace of HuXzoi" },
+        { "Temenos Aern", "75", "Temenos" },
+        { "Aw'aern", "75", "The Garden of RuHmet" },
     },
     ["emptythrash"] = {
         { "Craver", "28-39", "Promyvion-Mea" },
@@ -720,6 +744,7 @@ M.DATA = {
         { "Lesser Colibri", "66-68", "Nyzul Isle" },
         { "Colibri", "70-71", "Mamook" },
         { "Colibri", "71-73", "Bhaflau Thickets" },
+        { "Zoraal Ja's Pkuucha", "73", "Wajaom Woodlands" },
         { "Colibri", "74-75", "Bhaflau Remnants" },
         { "Chamrosh", "75", "Mamook" },
         { "Erawan", "75", "Wajaom Woodlands" },
@@ -731,6 +756,7 @@ M.DATA = {
         { "Ravenous Colibri", "75", "Wajaom Woodlands" },
         { "Wicked Dahak", "75", "Al Zahbi" },
         { "Yalungur", "75", "Mamook" },
+        { "Kubool Ja's Mhuufya", "75", "Wajaom Woodlands" },
     },
     ["filamentedhold"] = {
         { "Diremite", "38-40", "The Shrouded Maw" },
@@ -779,6 +805,7 @@ M.DATA = {
         { "Bugallug", "45-50", "Oldton Movalpolos" },
         { "Bugbear Porterman", "45-50", "Oldton Movalpolos" },
         { "Bugbear Strongman", "50", "Oldton Movalpolos" },
+        { "Bugbby", "63-64", "Mine Shaft 2716" },
         { "Bugbear Trashman", "65-67", "Newton Movalpolos" },
         { "Bugbear Watchman", "71-75", "Newton Movalpolos" },
         { "Bugbear Deathsman", "74-75", "Newton Movalpolos" },
@@ -851,6 +878,8 @@ M.DATA = {
         { "Mindertaur", "75", "Bearclaw Pinnacle" },
         { "Molech", "75", "Uleguerand Range" },
         { "Nightmare Taurus", "75", "Dynamis-Tavnazia" },
+        { "Apollyon Taurus", "75", "Apollyon" },
+        { "Bata", "75", "Apollyon" },
     },
     ["frostbreath"] = {
         { "Nival Raptor", "68-70", "Uleguerand Range" },
@@ -948,6 +977,7 @@ M.DATA = {
         { "Wild Dhalmel", "14-16", "Tahrongi Canyon" },
         { "Serpopard Ishtar", "19-20", "Tahrongi Canyon" },
         { "Bull Dhalmel", "21-24", "Buburimu Peninsula" },
+        { "Nenaunir's Wife", "30", "Balgas Dais" },
         { "Nenaunir", "33", "Balgas Dais" },
         { "Marine Dhalmel", "34-37", "Bibiki Bay" },
         { "Desert Dhalmel", "39-44", "Eastern Altepa Desert" },
@@ -958,10 +988,12 @@ M.DATA = {
         { "Locus Camelopard", "75", "Bibiki Bay" },
         { "Nightmare Dhalmel", "75", "Dynamis-Buburimu" },
         { "Serpopard Ishtar", "75", "Nyzul Isle" },
+        { "Troglodyte Dhalmel", "75", "Apollyon" },
     },
     ["heatbreath"] = {
         { "Lesser Manticore", "47-49", "Eastern Altepa Desert" },
         { "Desert Manticore", "53-57", "Western Altepa Desert" },
+        { "Dahu", "57", "Western Altepa Desert" },
         { "Eastern Sphinx", "62", "Western Altepa Desert" },
         { "Western Sphinx", "62", "Western Altepa Desert" },
         { "Ogmios", "65", "Cloister of Gales" },
@@ -981,6 +1013,8 @@ M.DATA = {
         { "Purson", "75", "Chamber of Oracles" },
         { "Qilin", "75", "The Shrine of RuAvitau" },
         { "Yali", "75", "Full Moon Fountain" },
+        { "Criosphinx", "75", "Apollyon" },
+        { "Hieracosphinx", "75", "Apollyon" },
     },
     ["hecatombwave"] = {
         { "Demon Pawn", "48-52", "Castle Zvahl Baileys" },
@@ -1097,7 +1131,9 @@ M.DATA = {
         { "Wind Golem", "50", "QuBia Arena" },
         { "Colossus", "56-58", "Fei'Yin" },
         { "Nunyunuwi", "56-58", "PsoXja" },
+        { "Trompe L'Oeil", "60", "Temple of Uggalepih" },
         { "Goliath", "62", "Fei'Yin" },
+        { "Huwasi", "64-65", "The Sanctuary of Zi'Tah" },
         { "Mokkurkalfi", "68-70", "RoMaeve" },
         { "Mythril Golem", "68-70", "RoMaeve" },
         { "Lode Golem", "70", "RoMaeve" },
@@ -1211,6 +1247,7 @@ M.DATA = {
         { "Geush Urvan", "75", "Uleguerand Range" },
         { "Himinrjot", "75", "Hazhalm Testing Grounds" },
         { "King Buffalo", "75", "Uleguerand Range" },
+        { "Mountain Buffalo", "75", "Apollyon" },
     },
     ["maelstrom"] = {
         { "Sea Monk", "21-29", "Ship bound for Mhaura" },
@@ -1256,6 +1293,8 @@ M.DATA = {
         { "Bullbeggar", "75", "Den of Rancor" },
         { "Mischievous Micholas", "75", "Nyzul Isle" },
         { "Natty Gibbon", "75", "Dangruf Wadi" },
+        { "Arboricole Opo-opo", "75", "Apollyon" },
+        { "Kerkopes", "75", "Apollyon" },
     },
     ["magichammer"] = {
         { "Mikilulu", "50", "Mamook" },
@@ -1344,6 +1383,7 @@ M.DATA = {
         { "Soaring Corse", "75", "Maquette Abdhaljs-Legion A" },
         { "Soaring Kumakatok", "75", "Maquette Abdhaljs-Legion A" },
         { "Xolotl", "75", "Attohwa Chasm" },
+        { "Grave Digger", "75", "Apollyon" },
     },
     ["metallicbody"] = {
         { "River Crab", "2-3", "West Sarutabaruta" },
@@ -1481,8 +1521,11 @@ M.DATA = {
         { "Emergent Elm", "75", "Nyzul Isle" },
     },
     ["plasmacharge"] = {
+        { "Ru'phuabo", "67", "AlTaieu" },
         { "Jailer of Hope", "75", "AlTaieu" },
         { "Mind-warped Scorpion", "75", "Palborough Mines" },
+        { "Om'phuabo", "75", "AlTaieu" },
+        { "Ul'phuabo", "75", "AlTaieu" },
     },
     ["poisonbreath"] = {
         { "Mad Fox", "3-8", "East Sarutabaruta" },
@@ -1643,9 +1686,14 @@ M.DATA = {
         { "Tammuz", "75", "La Theine Plateau" },
         { "Tammuz", "75", "Tahrongi Canyon" },
         { "Tavnazian Ram", "75", "Lufaise Meadows" },
+        { "Zlatorog", "75", "Apollyon" },
     },
     ["reactorcool"] = {
         { "Jailer of Temperance", "75", "Grand Palace of HuXzoi" },
+        { "Eo'zdei", "75", "Grand Palace of HuXzoi" },
+        { "Aw'zdei", "75", "The Garden of RuHmet" },
+        { "Ix'zdei", "75", "The Garden of RuHmet" },
+        { "Qn'zdei", "75", "The Garden of RuHmet" },
     },
     ["refueling"] = {
         { "Cluster", "38-40", "Lufaise Meadows" },
@@ -1667,6 +1715,9 @@ M.DATA = {
         { "Odqan", "75", "Nyzul Isle" },
     },
     ["salinecoat"] = {
+        { "Qn'xzomit", "67", "AlTaieu" },
+        { "Ul'xzomit", "68-71", "AlTaieu" },
+        { "Om'xzomit", "72-75", "AlTaieu" },
         { "Jailer of Justice", "75", "AlTaieu" },
     },
     ["sandspin"] = {
@@ -1912,6 +1963,7 @@ M.DATA = {
         { "Qutrub Wastrel", "75", "Al Zahbi" },
         { "Qutrub Wastrel", "75", "Bhaflau Thickets" },
         { "Zareehkl the Jubilant", "75", "Arrapago Reef" },
+        { "Assassin's Apprentice", "75", "Arrapago Reef" },
     },
     ["sproutsmack"] = {
         { "Walking Sapling", "3-6", "North Gustaberg" },
@@ -1992,6 +2044,9 @@ M.DATA = {
         { "Merrow Shiranuhi", "75", "Bhaflau Thickets" },
     },
     ["temporalshift"] = {
+        { "Qn'hpemde", "67", "AlTaieu" },
+        { "Ul'hpemde", "68-72", "AlTaieu" },
+        { "Om'hpemde", "73-75", "AlTaieu" },
         { "Jailer of Prudence", "75", "AlTaieu" },
     },
     ["terrortouch"] = {
@@ -2033,6 +2088,9 @@ M.DATA = {
         { "Ancient Goobbue", "75", "The Boyahda Tree" },
         { "Jolly Green", "75", "Nyzul Isle" },
         { "Nightmare Goobbue", "75", "Dynamis-Valkurm" },
+        { "Goobbue Harvester", "75", "Apollyon" },
+        { "Lost Nant'ina", "75", "Dynamis-Valkurm" },
+        { "Nant'ina", "75", "Dynamis-Valkurm" },
     },
     ["vanitydive"] = {
         { "Stray", "20-27", "Promyvion-Dem" },
@@ -2051,7 +2109,14 @@ M.DATA = {
         { "Apex Idle Drifter", "75", "Promyvion-Vahzl" },
     },
     ["verticalcleave"] = {
+        { "Aern's Euvhi", "65-68", "The Garden of RuHmet" },
+        { "Aw'euvhi", "71-75", "AlTaieu" },
+        { "Eo'euvhi", "74-75", "Grand Palace of HuXzoi" },
         { "Jailer of Faith", "75", "The Garden of RuHmet" },
+        { "Aern's Euvhi", "75", "Temenos" },
+        { "Temenos Euvhi", "75", "Temenos" },
+        { "Thalesek", "75", "Temenos" },
+        { "Aw'euvhi", "75", "The Garden of RuHmet" },
     },
     ["voracioustrunk"] = {
         { "Marid", "66-68", "Nyzul Isle" },
@@ -2094,6 +2159,7 @@ M.DATA = {
         { "Mamool Ja Breeder", "75", "Mamool Ja Training Grounds" },
     },
     ["wildcarrot"] = {
+        { "Goblin's Rarab", "29-31", "Bibiki Bay" },
         { "Island Rarab", "34-36", "Bibiki Bay" },
         { "Variable Hare", "58-61", "Uleguerand Range" },
         { "Polar Hare", "65-68", "Uleguerand Range" },
@@ -2152,6 +2218,7 @@ M.DATA = {
         { "King Apkallu", "75", "Mount Zhayolm" },
         { "Restless Apkallu", "75", "Al Zahbi" },
         { "Restless Apkallu", "75", "Bhaflau Thickets" },
+        { "Lil' Apkallu", "75", "Arrapago Reef" },
     },
     ["zephyrmantle"] = {
         { "Puk", "67-70", "Nyzul Isle" },
@@ -2169,19 +2236,27 @@ M.DATA = {
         { "Sea Puk", "75", "Mamook" },
         { "Snaggletooth Peapuk", "75", "The Boyahda Tree" },
         { "Vulpangue", "75", "Wajaom Woodlands" },
-    },    ["coldwave"] = {
+    },
+    ["coldwave"] = {
         { "Snowball", "43-46", "Pso'Xja" },
         { "Snoll", "57-58", "Pso'Xja" },
         { "Snoll", "60-63", "Uleguerand Range" },
         { "Morozko", "65-66", "Pso'Xja" },
         { "Morozko", "67-70", "Uleguerand Range" },
         { "Akselloak", "71-74", "Uleguerand Range" },
+        { "Snow Maiden", "71-72", "Uleguerand Range" },
+        { "Frost Flambeau", "72-74", "Uleguerand Range" },
+        { "Father Frost", "74-75", "Uleguerand Range" },
         { "Avalanche", "75", "Uleguerand Range" },
         { "Agloolik", "75", "Uleguerand Range" },
+        { "Snow Devil", "75", "Bearclaw Pinnacle" },
+        { "Nightmare Snoll", "75", "Dynamis-Qufim" },
+        { "Avalanche", "75", "PsoXja" },
     },
     ["venomshell"] = {
         { "Uragnite", "30-37", "Manaclipper" },
         { "Coralline Uragnite", "32-35", "Bibiki Bay - Purgonorgo Isle" },
     },
 }
+
 return M

@@ -110,7 +110,7 @@ M.LIST = {
     { 61, 'Maelstrom',          'Mag',  'Water',    'Damage',   'Clear Mind',          'Water dmg (STR down)', 'Aquans',   162, true },
     { 61, 'Eyes On Me',         'Mag',  'Dark',     'Damage',   'Magic Attack Bonus',  'Dark dmg',             'Demons',   112 },
     { 61, 'Seedspray',          'Phys', 'Slashing', 'Damage',   'Beast Killer',        'Induration/Detonation','Plantoids',61 },
-    { 61, 'Bad Breath',         'Mag',  'Earth',    'Enfeeble', 'Fast Cast',           'Breath (multi-ail.)',  'Plantoids',212 },
+    { 61, 'Bad Breath',         'Mag',  'Earth',    'Enfeeble', 'Fast Cast',           'Breath (multi-ail.)',  'Plantoids',212, true },
     { 62, '1000 Needles',       'Mag',  'Light',    'Damage',   'Beast Killer',        'Light dmg (fixed)',    'Plantoids',350 },
     { 62, 'Body Slam',          'Phys', 'Blunt',    'Damage',   'Max HP Boost',        'Impaction',            'Dragons',  74 },
     { 62, 'Memento Mori',       'Mag',  'Ice',      'Buff',     'Magic Attack Bonus',  'Magic Atk +20',        'Undead',   46 },
