@@ -109,12 +109,11 @@ M.LIST = {
     { 60, 'Dimensional Death',  'Phys', 'H2H',      'Damage',   'Accuracy Bonus',      'Transfixion/Impaction','Undead',   48 },
     { 61, 'Maelstrom',          'Mag',  'Water',    'Damage',   'Clear Mind',          'Water dmg (STR down)', 'Aquans',   162, true },
     { 61, 'Eyes On Me',         'Mag',  'Dark',     'Damage',   'Magic Attack Bonus',  'Dark dmg',             'Demons',   112 },
-    { 61, 'Seedspray',          'Phys', 'Slashing', 'Damage',   'Beast Killer',        'Induration/Detonation','Plantoids',61 },
     { 61, 'Bad Breath',         'Mag',  'Earth',    'Enfeeble', 'Fast Cast',           'Breath (multi-ail.)',  'Plantoids',212, true },
     { 62, '1000 Needles',       'Mag',  'Light',    'Damage',   'Beast Killer',        'Light dmg (fixed)',    'Plantoids',350 },
     { 62, 'Body Slam',          'Phys', 'Blunt',    'Damage',   'Max HP Boost',        'Impaction',            'Dragons',  74 },
     { 62, 'Memento Mori',       'Mag',  'Ice',      'Buff',     'Magic Attack Bonus',  'Magic Atk +20',        'Undead',   46 },
-    { 63, 'Frenetic Rip',       'Phys', 'Blunt',    'Damage',   'Accuracy Bonus',      'Induration',           'Demons',   61 },
+    { 63, 'Frenetic Rip',       'Phys', 'Blunt',    'Damage',   'None',                'Induration',           'Demons',   61 },
     { 63, 'Frypan',             'Phys', 'Blunt',    'Damage',   'Max HP Boost',        'Impaction (Stun)',     'Beastmen', 65 },
     { 63, 'Hydro Shot',         'Phys', 'H2H',      'Damage',   'Rapid Shot',          'Reverb./Fragmentation','Beastmen', 55 },
     { 63, 'Spinal Cleave',      'Phys', 'Slashing', 'Damage',   'Attack Bonus',        'Scission/Detonation',  'Undead',   61 },
@@ -141,7 +140,7 @@ M.LIST = {
     { 73, 'Ram Charge',         'Phys', 'Blunt',    'Damage',   'Lizard Killer',       'Fragmentation',        'Beasts',   nil },
     { 73, 'Temporal Shift',     'Mag',  'Thunder',  'Damage',   'Attack Bonus',        'Thunder dmg (Stun)',   '—',        nil },
     { 74, 'Actinic Burst',      'Mag',  'Light',    'Enfeeble', 'Auto Refresh',        'AoE Flash',            '—',        nil },
-    { 74, 'Magic Hammer',       'Mag',  'Light',    'Damage',   'Magic Attack Bonus',  'Light dmg (MP drain)', 'Beastmen', nil, true },
+    { 74, 'Magic Hammer',       'Mag',  'Light',    'Damage',   'None',                'Light dmg (MP drain)', 'Beastmen', nil, true },
     { 74, 'Reactor Cool',       'Mag',  'Ice',      'Enfeeble', 'Magic Defense Bonus', 'None',                 '—',        nil, true },
     { 75, 'Exuviation',         'Mag',  'Fire',     'Heal',     'Resist Sleep',        'Cure + remove ail.',   '—',        nil },
     { 75, 'Plasma Charge',      'Mag',  'Thunder',  'Damage',   'Auto Refresh',        'Thunder dmg',          'Arcana',   nil },
@@ -154,9 +153,19 @@ local function keyify(name)
     return (name:lower():gsub('[^%w]', ''))
 end
 
-M.SPELLS = {}       -- array of { key, lvl, name, kind, elem, role, trait, prop, fam, mp, hz }
+M.SPELLS = {}       -- array of { key, lvl, name, kind, elem, role, trait, prop, fam, mp, hz, aliases }
 M.BY_KEY = {}       -- key -> record
 M.BY_NAME = {}      -- exact name -> record
+
+-- In-game spell-name variants as they appear in the "<player> learns X." chat
+-- message. A few HorizonXI spells are shown/announced under a shortened name
+-- (the client truncates long names), so learn-detection must match those too.
+-- key -> array of in-game name strings. The tracker's display still uses the
+-- full name from M.LIST above; these are only for matching the learn message.
+M.ALIASES = {
+    quadraticcontinuum = { 'Quad. Continuum' },
+    windsofpromyvion   = { 'Winds of Promy.' },
+}
 
 for _, r in ipairs(M.LIST) do
     local rec = {
@@ -172,6 +181,7 @@ for _, r in ipairs(M.LIST) do
         hz    = r[10] or false,
         key   = keyify(r[2]),
     }
+    rec.aliases = M.ALIASES[rec.key]
     M.SPELLS[#M.SPELLS + 1] = rec
     M.BY_KEY[rec.key]  = rec
     M.BY_NAME[rec.name] = rec

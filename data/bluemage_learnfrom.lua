@@ -1798,9 +1798,6 @@ M.DATA = {
         { "Sea Pugil", "10-20", "Ship bound for Mhaura" },
         { "Sea Pugil", "10-20", "Ship bound for Mhaura Pirates" },
     },
-    ["seedspray"] = {
-        { "Ravishing Rafflesia", "75", "Aydeewa Subterrane" },
-    },
     ["selfdestruct"] = {
         { "Balloon", "8-10", "East Sarutabaruta" },
         { "Balloon", "8-10", "Inner Horutoto Ruins" },

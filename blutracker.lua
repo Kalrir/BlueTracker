@@ -21,7 +21,7 @@
 
 addon.name    = 'BluTracker';
 addon.author  = 'Kalrir';
-addon.version = '1.11';
+addon.version = '1.12';
 addon.desc    = 'Blue Magic spell-learning tracker with a where-to-learn guide.';
 
 require('common');

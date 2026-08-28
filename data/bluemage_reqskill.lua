@@ -73,7 +73,6 @@ return {
     ["dimensionaldeath"] = 172,
     ["maelstrom"] = 176,
     ["eyesonme"] = 176,
-    ["seedspray"] = 176,
     ["badbreath"] = 176,
     ["1000needles"] = 181,
     ["bodyslam"] = 181,

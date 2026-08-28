@@ -1757,7 +1757,18 @@ function M.init(host)
         -- jobs' spell learns (e.g. RDM scribing) don't trigger it.
         pcall(function()
             local set = {}
-            for _, r in ipairs(DB.SPELLS) do set[r.name:lower()] = true end
+            for _, r in ipairs(DB.SPELLS) do
+                set[r.name:lower()] = true
+                if r.aliases then
+                    for _, a in ipairs(r.aliases) do
+                        local al = a:lower()
+                        set[al] = true
+                        -- BlueLearn strips trailing non-alpha before lookup, so
+                        -- register that form too (e.g. "winds of promy." -> "winds of promy").
+                        set[al:gsub('[^%a]+$', '')] = true
+                    end
+                end
+            end
             BlueLearn.set_valid_spells(set)
         end)
     end
@@ -2707,8 +2718,15 @@ function M.text_in(e)
     local clean = CleanText(msg)
     if not clean:lower():find('learn', 1, true) then return end
 
+    local lc = clean:lower()
     for _, r in ipairs(DB.SPELLS) do
-        if clean:find(r.name, 1, true) then
+        local hit = lc:find(r.name:lower(), 1, true) ~= nil
+        if not hit and r.aliases then
+            for _, a in ipairs(r.aliases) do
+                if lc:find(a:lower(), 1, true) then hit = true break end
+            end
+        end
+        if hit then
             if not learned[r.key] then
                 learned[r.key] = true
                 print(('[BluTracker] Marked "%s" learned (%d/%d).')
