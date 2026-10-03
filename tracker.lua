@@ -2,16 +2,17 @@
 * BlueMage - Blue Magic spell-learning tracker (HorizonXI)
 *
 * The tracker module for the standalone BlueMage addon. Bound to the addon
-* host (bluemage.lua) via M.init(host). Window settings (lock, hide-on-menu,
-* BG color, open state, filter toggles) come from the host's cfg under the
+* host (bluemage.lua) via M.init(host). Window settings (lock, open state,
+* filter toggles) come from the host's cfg under the
 * `bluemage_*` namespace. Per-character learned state lives under
 * cfg.bluemage_data.learned (key -> bool), which is persisted by the settings
 * library (settings are per-character in Ashita, so learned Blue Magic is
 * naturally tracked per character).
 *
-* The main "Blue Magic" window carries two tabs: "Spells" (this tracker) and
-* "Settings" (the config UI). The title-bar gear and `/blutracker config` jump to the
-* Settings tab.
+* The main "Blue Magic" window carries five tabs: "Spells" (this tracker),
+* "Zones", "Traits", "Counter" (seen counts by ability / monster) and
+* "Settings" (the config UI). The mini tracker's title-bar gear toggles the
+* window on the last tab used; `/blutracker config` jumps to the Settings tab.
 *
 * The window lists every Blue Magic spell learnable at level 75 and below on
 * HorizonXI (a 75-era + "Era+" server). Data comes from data/bluemage_spells.lua,
@@ -38,6 +39,35 @@ local MRL   = require('data/bluemage_mrl')         -- key -> min BLU level to le
 local REQSK = require('data/bluemage_reqskill')    -- key -> Blue Magic skill to learn
 local ZONES = require('data/bluemage_zones')       -- zone id -> formatted zone name
 
+-- Level-capped zones: drop learn-from entries that can't be learned because
+-- the zone's level cap is below the spell's minimum learn level (MRL). Done
+-- once here so every list, the Zone tab, the Tracker and the maps agree.
+-- Guarded: a missing/broken caps file leaves the data untouched.
+local ok_caps, ZONECAPS = pcall(require, 'data/bluemage_zonecaps')
+if not ok_caps or type(ZONECAPS) ~= 'table' then ZONECAPS = {} end
+local CAPPED_OUT = {}   -- key -> { { zone, cap }, ... } removed, for the UI note
+do
+    for key, rows in pairs(LF.DATA) do
+        local need = MRL[key]
+        if type(need) == 'number' and type(rows) == 'table' then
+            local keep, gone = {}, {}
+            for _, row in ipairs(rows) do
+                local cap = ZONECAPS[row[3]]
+                if cap and need > cap then
+                    if not gone[row[3]] then
+                        gone[row[3]] = true
+                        CAPPED_OUT[key] = CAPPED_OUT[key] or {}
+                        table.insert(CAPPED_OUT[key], { row[3], cap })
+                    end
+                else
+                    keep[#keep + 1] = row
+                end
+            end
+            LF.DATA[key] = keep
+        end
+    end
+end
+
 -- Notorious Monster (NM) display helpers. learnfrom rows carry an optional 4th
 -- element (== true) when the mob is an NM; these render a gold "[NM]" tag next
 -- to the monster name so it's clear the source is a notorious monster.
@@ -62,6 +92,12 @@ if not ok_gm then gamemap = nil end
 -- unavailable and the rest of the Blue Mage module is unaffected.
 local ok_bl, BlueLearn = pcall(require, 'BlueLearn')
 if not ok_bl then BlueLearn = nil end
+
+-- Optional extra monster-ability names for the "seen" counter, for any Blue
+-- Magic spell whose monster TP move shows up in chat under a different name.
+-- Guarded: a missing/broken file just means spell names + aliases are used.
+local ok_mm, MOBMOVES = pcall(require, 'data/bluemage_mobmoves')
+if not ok_mm or type(MOBMOVES) ~= 'table' then MOBMOVES = {} end
 
 local M = {}
 
@@ -354,6 +390,7 @@ local FLOORCACHE  = {}
 -- Bound subtable of cfg.bluemage_data once init() runs:
 local learned = nil   -- key -> bool
 local tracked = nil   -- key -> bool (spells the user flagged for the tracker)
+local seen    = nil   -- key -> number (times a monster was seen using it while on BLU)
 
 -- =========================
 -- Constants
@@ -367,12 +404,12 @@ local DETAIL_HEIGHT  = 140   -- "Learned From" panel at the bottom
 -- Column widths (pixels) for the Columns() table layout.
 -- Order: Learned | Trk | MRL | LVL | Spell | Type | Trait | Family
 local CW_CHECK = 30
-local CW_TRK   = 78
+local CW_TRK   = 72
 local CW_MRL   = 40
 local CW_LV    = 36
 local CW_NAME  = 156
-local CW_TYPE  = 104
-local CW_TRAIT = 130
+local CW_TYPE  = 84    -- longest: "P Slashing"
+local CW_TRAIT = 156   -- longest: "Magic Accuracy Bonus"
 local CW_FAM   = 82
 
 -- Element / damage-type tint for the Type column (and a faint row accent).
@@ -415,6 +452,7 @@ end
 -- User-selected "specific" spells to track. Persisted (unlike learned).
 M.default_track = T{
     tracked = T{},
+    seen    = T{},   -- key -> count of times seen in chat while on BLU (persisted)
 }
 for _, r in ipairs(DB.SPELLS) do
     M.default_track.tracked[r.key] = false
@@ -428,16 +466,11 @@ M.default_window = {
     bluemage_win_y         = 200,
     bluemage_font_scale    = 1.0,
     bluemage_lock_ui       = false,
-    bluemage_hide_on_menu  = false,
     bluemage_auto_learn    = true,
     bluemage_hide_learned  = false,
     bluemage_only_my_level = false,
     bluemage_map_scale       = 1.0,
     bluemage_show_player     = true,
-    bluemage_bg_color_r    = 0.06,
-    bluemage_bg_color_g    = 0.07,
-    bluemage_bg_color_b    = 0.10,
-    bluemage_bg_color_a    = 0.96,
 }
 
 -- =========================
@@ -452,9 +485,440 @@ local famFilter   = 'All'
 local TRACK_MODES = { { 'off', 'Off' }, { 'specific', 'Specific' }, { 'zone', 'Zone' } }
 
 -- =========================
+-- UI kit (ported from Codex's CONFIG UI KIT)
+--
+-- Same palette and layout as Codex: groups of options sit in bordered
+-- panels with a soft drop shadow and a centered, ruled title. Inside, a
+-- two-column table: label on the left (hover it for help), control on the
+-- right, short status notes beside the control. Sliders preview live, save
+-- when you let go, and show a small Reset when moved off their default.
+-- Also holds Codex's sub-tab colors and scrollbar colors.
+--
+-- Built inside one function so it costs the main chunk a single local
+-- (the chunk is close to Lua's 200-local limit).
+-- =========================
+local UIK = (function()
+local UI = {
+    label   = { 0.75, 0.78, 0.90, 1.00 },  -- row labels
+    dim     = { 0.55, 0.58, 0.72, 1.00 },  -- notes / hints
+    head    = { 0.55, 0.65, 1.00, 1.00 },  -- panel titles
+    value   = { 0.40, 0.70, 1.00, 1.00 },  -- live readouts
+    warn    = { 1.00, 0.55, 0.45, 1.00 },  -- warnings / confirm
+    panel   = { 0.11, 0.12, 0.17, 1.00 },  -- panel fill
+    border  = { 0.28, 0.26, 0.38, 0.90 },  -- panel border / title rules
+    shadow  = { 0.00, 0.00, 0.00, 0.35 },
+    btn     = { 0.20, 0.18, 0.28, 1.00 },  -- Reset / Test buttons
+    btn_hov = { 0.30, 0.28, 0.42, 1.00 },
+}
+local PAD_X    = 10    -- panel inner padding
+local PAD_Y    = 8
+local SPACE_Y  = 6     -- item spacing inside panels
+local GAP      = 12    -- space between panels
+local SHADOW   = 3
+local RULE_W   = 2.0   -- thickness of the lines beside panel titles
+local SLIDER_W = 160
+local LABEL_REFS = { 'Vertical position', 'Lock its position', 'Decorative lines', 'Open the window' }
+
+local sec_h = {}       -- panel id -> height measured last frame
+local sec   = nil      -- panel currently open
+
+local function text(col, s)
+    imgui.PushStyleColor(ImGuiCol_Text, col)
+    imgui.Text(s)
+    imgui.PopStyleColor(1)
+end
+
+-- Hover help for the last item, wrapped to a readable width.
+local function tip(s)
+    if not s or not imgui.IsItemHovered() then return end
+    if imgui.PushTextWrapPos then
+        imgui.BeginTooltip()
+        imgui.PushTextWrapPos(imgui.GetTextLineHeight() * 24)
+        imgui.Text(s)
+        imgui.PopTextWrapPos()
+        imgui.EndTooltip()
+    else
+        imgui.SetTooltip(s)
+    end
+end
+
+-- Short note beside the last control; drops to its own line if it won't fit.
+local function side(s, col)
+    local fits = true
+    if imgui.GetItemRectMax then
+        local mx = imgui.GetItemRectMax()
+        local cx = imgui.GetCursorScreenPos()
+        local aw = imgui.GetContentRegionAvail()
+        if type(mx) == 'number' and type(cx) == 'number' and type(aw) == 'number' then
+            fits = (mx + 8 + imgui.CalcTextSize(s)) <= (cx + aw)
+        end
+    end
+    if fits then imgui.SameLine(0, 8) end
+    imgui.AlignTextToFramePadding()
+    imgui.PushStyleColor(ImGuiCol_Text, col or UI.dim)
+    imgui.TextWrapped(s)
+    imgui.PopStyleColor(1)
+end
+
+local function section_begin(id, title, width)
+    local x, y = imgui.GetCursorScreenPos()
+    local dl   = imgui.GetWindowDrawList()
+    local h    = sec_h[id]
+    if h and h > 0 then
+        dl:AddRectFilled({ x + SHADOW, y + SHADOW }, { x + width + SHADOW, y + h + SHADOW },
+            imgui.GetColorU32(UI.shadow), 5.0)
+        dl:AddRectFilled({ x, y }, { x + width, y + h }, imgui.GetColorU32(UI.panel), 5.0)
+        dl:AddRect({ x, y }, { x + width, y + h }, imgui.GetColorU32(UI.border), 5.0, 0, 1.0)
+    end
+    sec = { id = id, x = x, y = y, w = width }
+
+    imgui.PushStyleVar(ImGuiStyleVar_ItemSpacing, { 8.0, SPACE_Y })
+    imgui.Dummy({ 0, math.max(0, PAD_Y - SPACE_Y) })
+    imgui.Indent(PAD_X)
+
+    -- Title centered in the panel, with a rule on each side.
+    local hx, hy = imgui.GetCursorScreenPos()
+    local tw = imgui.CalcTextSize(title)
+    local tx = x + (width - tw) * 0.5
+    imgui.SetCursorPosX(imgui.GetCursorPosX() + (tx - hx))
+    text(UI.head, title)
+    local ly  = hy + imgui.GetTextLineHeight() * 0.5
+    local col = imgui.GetColorU32(UI.border)
+    local lx1, lx2 = x + PAD_X, tx - 8
+    local rx1, rx2 = tx + tw + 8, x + width - PAD_X
+    if lx2 > lx1 then dl:AddLine({ lx1, ly }, { lx2, ly }, col, RULE_W) end
+    if rx2 > rx1 then dl:AddLine({ rx1, ly }, { rx2, ly }, col, RULE_W) end
+end
+
+local function section_end()
+    local s = sec
+    if not s then return end
+    imgui.Unindent(PAD_X)
+    imgui.Dummy({ 0, math.max(0, PAD_Y - SPACE_Y) })
+    local _, y2 = imgui.GetCursorScreenPos()
+    sec_h[s.id] = (y2 - SPACE_Y) - s.y
+    -- Gap to the next panel as a real item (SetCursorPosY past the last
+    -- item trips ImGui's "extend window boundaries" check).
+    imgui.Dummy({ 0, math.max(0, GAP - 2 * SPACE_Y) })
+    imgui.PopStyleVar(1)
+    sec = nil
+end
+
+-- Two-column rows table for the open panel. Call imgui.EndTable() when done
+-- (only if this returned true).
+local function rows_begin(id)
+    local s  = sec
+    local tw = (s and s.w or 300) - 2 * PAD_X
+    if not imgui.BeginTable(id, 2, ImGuiTableFlags_SizingFixedFit or 0, { tw, 0 }) then return false end
+    local lw = 0
+    for _, t in ipairs(LABEL_REFS) do lw = math.max(lw, (imgui.CalcTextSize(t))) end
+    imgui.TableSetupColumn('label',   ImGuiTableColumnFlags_WidthFixed or 0, lw + 16)
+    imgui.TableSetupColumn('control', ImGuiTableColumnFlags_WidthStretch or 0)
+    return true
+end
+
+local function row(label, help, col)
+    imgui.TableNextRow()
+    imgui.TableSetColumnIndex(0)
+    imgui.AlignTextToFramePadding()
+    text(col or UI.label, label)
+    tip(help)
+    imgui.TableSetColumnIndex(1)
+end
+
+-- Checkbox; calls apply(new value) and saves on click.
+local function check(id, value, apply, help)
+    local var = { value and true or false }
+    local changed = imgui.Checkbox(id, var)
+    if changed then
+        apply(var[1])
+        settings.save()
+    end
+    tip(help)
+    return changed
+end
+
+local function button(label, w)
+    imgui.PushStyleColor(ImGuiCol_Button,        UI.btn)
+    imgui.PushStyleColor(ImGuiCol_ButtonHovered, UI.btn_hov)
+    local clicked = imgui.Button(label, { w or 0, 0 })
+    imgui.PopStyleColor(2)
+    return clicked
+end
+
+-- Slider. Applies live while dragging, saves on release, and shows a small
+-- Reset when off its default.
+local function slider(kind, id, value, mn, mx, fmt, def, apply, help, width)
+    local var = { value }
+    imgui.SetNextItemWidth(width or SLIDER_W)
+    local changed
+    if kind == 'int' then
+        changed = imgui.SliderInt(id, var, mn, mx, fmt)
+    else
+        changed = imgui.SliderFloat(id, var, mn, mx, fmt)
+    end
+    if changed then apply(var[1]) end
+    local done = changed
+    if imgui.IsItemDeactivatedAfterEdit then done = imgui.IsItemDeactivatedAfterEdit() end
+    if done then settings.save() end
+    tip(help)
+    if def ~= nil and math.abs(var[1] - def) > 1e-4 then
+        imgui.SameLine(0, 6)
+        imgui.PushStyleColor(ImGuiCol_Button,        UI.btn)
+        imgui.PushStyleColor(ImGuiCol_ButtonHovered, UI.btn_hov)
+        local reset = imgui.SmallButton('Reset' .. id)
+        imgui.PopStyleColor(2)
+        if reset then
+            apply(def)
+            settings.save()
+        end
+    end
+end
+
+-- A dim wrapped explanation line inside a panel (outside a table).
+local function note(s)
+    imgui.PushStyleColor(ImGuiCol_Text, UI.dim)
+    local p = sec
+    if p and imgui.PushTextWrapPos then
+        local wx = imgui.GetWindowPos()
+        imgui.PushTextWrapPos(p.x + p.w - PAD_X - wx)
+        imgui.Text(s)
+        imgui.PopTextWrapPos()
+    else
+        imgui.TextWrapped(s)
+    end
+    imgui.PopStyleColor(1)
+end
+
+-- Full-width block inside the open panel: a one-column table sized to the
+-- panel, so selectables, tables and wide widgets stop at the panel edge.
+-- Call block_end() when done (only if this returned true).
+local function block_begin(id)
+    local p  = sec
+    local tw = (p and p.w or 300) - 2 * PAD_X
+    if not imgui.BeginTable(id, 1, 0, { tw, 0 }) then return false end
+    imgui.TableNextRow()
+    imgui.TableSetColumnIndex(0)
+    return true
+end
+local function block_end() imgui.EndTable() end
+
+-- Inner width of the open panel (between its paddings).
+local function inner_width()
+    return ((sec and sec.w) or 300) - 2 * PAD_X
+end
+
+-- ---------- Size-preserving frames ----------
+-- The Codex panel look (drop shadow, fill, border, rounded corners) wrapped
+-- around a scrolling child that keeps the EXACT footprint the plain child had:
+-- the frame is w x h, and the child sits inside it with a small inset. Use in
+-- place of BeginChild(id, { w, h }) where w/h <= 0 mean "all available".
+local FPAD = 5
+local frame_depth = 0
+local function frame_begin(id, w, h)
+    local aw, ah = 300, 200
+    pcall(function()
+        local a, b = imgui.GetContentRegionAvail()
+        if type(a) == 'number' then aw = a end
+        if type(b) == 'number' then ah = b end
+    end)
+    if not w or w <= 0 then w = aw + (w or 0) - SHADOW end   -- keep the shadow inside
+    if not h or h <= 0 then h = ah + (h or 0) - SHADOW end
+    w, h = math.max(40, w), math.max(30, h)
+    local x, y = imgui.GetCursorScreenPos()
+    local dl = imgui.GetWindowDrawList()
+    dl:AddRectFilled({ x + SHADOW, y + SHADOW }, { x + w + SHADOW, y + h + SHADOW }, imgui.GetColorU32(UI.shadow), 5.0)
+    dl:AddRectFilled({ x, y }, { x + w, y + h }, imgui.GetColorU32(UI.panel), 5.0)
+    dl:AddRect({ x, y }, { x + w, y + h }, imgui.GetColorU32(UI.border), 5.0, 0, 1.0)
+    -- Group = exactly w x h for the layout; the child is placed inside it.
+    imgui.BeginGroup()
+    imgui.Dummy({ w, h })
+    imgui.SetCursorScreenPos({ x + FPAD, y + FPAD })
+    imgui.PushStyleColor(ImGuiCol_ChildBg,       { 0, 0, 0, 0 })
+    -- Selection rows a little lighter than the window theme so they still
+    -- stand out against the panel fill.
+    imgui.PushStyleColor(ImGuiCol_Header,        { 0.20, 0.19, 0.30, 1.00 })
+    imgui.PushStyleColor(ImGuiCol_HeaderHovered, { 0.26, 0.25, 0.38, 1.00 })
+    imgui.PushStyleColor(ImGuiCol_HeaderActive,  { 0.30, 0.29, 0.44, 1.00 })
+    imgui.BeginChild(id, { w - 2 * FPAD, h - 2 * FPAD })
+    frame_depth = frame_depth + 1
+end
+local function frame_end()
+    if frame_depth <= 0 then return end
+    frame_depth = frame_depth - 1
+    imgui.EndChild()
+    imgui.PopStyleColor(4)
+    imgui.EndGroup()
+end
+
+-- Codex-style heading rule drawn after the last item on the current line
+-- (no extra height): a line from just past the item to the right edge.
+local function rule_after()
+    pcall(function()
+        local mx = imgui.GetItemRectMax()
+        local _, my0 = imgui.GetItemRectMin()
+        local _, my1 = imgui.GetItemRectMax()
+        local wx = imgui.GetWindowPos()
+        local cmx = imgui.GetWindowContentRegionMax and imgui.GetWindowContentRegionMax() or nil
+        local right
+        if type(cmx) == 'number' and type(wx) == 'number' then right = wx + cmx end
+        if not right then
+            local cx = imgui.GetCursorScreenPos()
+            local aw = imgui.GetContentRegionAvail()
+            right = (type(cx) == 'number' and type(aw) == 'number') and (cx + aw) or (mx + 200)
+        end
+        local ly = (my0 + my1) * 0.5
+        if right - (mx + 8) > 8 then
+            imgui.GetWindowDrawList():AddLine({ mx + 8, ly }, { right, ly }, imgui.GetColorU32(UI.border), RULE_W)
+        end
+    end)
+end
+
+-- Heading text in the panel-title color, followed by its rule.
+local function heading(s, col)
+    text(col or UI.head, s)
+    rule_after()
+end
+
+-- Centered heading with a rule on each side (like the panel titles):
+--   ------- Title -------
+-- Same height as a plain text line.
+-- An optional `suffix` is drawn after the title in `suffix_col` (dim by
+-- default) and centered together with it.
+local function heading_center(s, col, suffix, suffix_col)
+    local x, y = imgui.GetCursorScreenPos()
+    local aw = 200
+    pcall(function()
+        local a = imgui.GetContentRegionAvail()
+        if type(a) == 'number' then aw = a end
+    end)
+    local function w_of(str)
+        local w = imgui.CalcTextSize(str)
+        return (type(w) == 'number') and w or (#str * 7)
+    end
+    local tw = w_of(s)
+    if suffix then tw = tw + 8 + w_of(suffix) end
+    local tx = x + math.max(0, math.floor((aw - tw) * 0.5))
+    imgui.SetCursorPosX(imgui.GetCursorPosX() + (tx - x))
+    text(col or UI.head, s)
+    if suffix then
+        imgui.SameLine(0, 8)
+        text(suffix_col or UI.dim, suffix)
+    end
+    pcall(function()
+        local dl  = imgui.GetWindowDrawList()
+        local ly  = y + imgui.GetTextLineHeight() * 0.5
+        local c   = imgui.GetColorU32(UI.border)
+        local lx1, lx2 = x, tx - 8
+        local rx1, rx2 = tx + tw + 8, x + aw
+        if lx2 - lx1 > 4 then dl:AddLine({ lx1, ly }, { lx2, ly }, c, RULE_W) end
+        if rx2 - rx1 > 4 then dl:AddLine({ rx1, ly }, { rx2, ly }, c, RULE_W) end
+    end)
+end
+
+-- Width available to a panel at the cursor (leaves room for its shadow).
+local function panel_width()
+    return math.max(100, (imgui.GetContentRegionAvail()) - SHADOW - 2)
+end
+
+-- Tab bars styled like Codex's sidebar: dark idle tabs, lighter selected
+-- tab with the blue accent overline, bright text on the selected tab and
+-- dim text on the rest. Tab color constants were renamed in newer ImGui
+-- (TabActive -> TabSelected, TabUnfocused -> TabDimmed), so only the ones
+-- this client defines are pushed; tab_bar_end pops exactly that many.
+local TAB = {
+    idle     = { 0.09, 0.10, 0.14, 1.00 },
+    hover    = { 0.24, 0.28, 0.42, 1.00 },
+    active   = { 0.16, 0.18, 0.26, 1.00 },
+    accent   = { 0.40, 0.60, 1.00, 1.00 },
+    text_on  = { 0.88, 0.92, 1.00, 1.00 },
+    text_off = { 0.55, 0.58, 0.72, 1.00 },
+}
+local tab_sel    = {}   -- tab bar id -> label selected last frame
+local tab_pushed = {}   -- stack of color counts, one per open bar
+
+local function tab_bar_begin(id)
+    local n = 0
+    local function push(idx, col)
+        if idx ~= nil then imgui.PushStyleColor(idx, col); n = n + 1 end
+    end
+    push(ImGuiCol_Tab,                 TAB.idle)
+    push(ImGuiCol_TabHovered,          TAB.hover)
+    push(ImGuiCol_TabActive,           TAB.active)
+    push(ImGuiCol_TabSelected,         TAB.active)
+    push(ImGuiCol_TabSelectedOverline, TAB.accent)
+    push(ImGuiCol_TabUnfocused,        TAB.idle)
+    push(ImGuiCol_TabUnfocusedActive,  TAB.active)
+    push(ImGuiCol_TabDimmed,           TAB.idle)
+    push(ImGuiCol_TabDimmedSelected,   TAB.active)
+    local open = imgui.BeginTabBar(id, ImGuiTabBarFlags_DrawSelectedOverline or 0)
+    if open then
+        tab_pushed[#tab_pushed + 1] = n
+    else
+        imgui.PopStyleColor(n)
+    end
+    return open
+end
+
+local function tab_bar_end()
+    imgui.EndTabBar()
+    local n = table.remove(tab_pushed) or 0
+    if n > 0 then imgui.PopStyleColor(n) end
+end
+
+-- BeginTabItem with bright/dim label colors (selection known from last frame).
+local function tab_item(bar, label, flags)
+    local on = (tab_sel[bar] == label)
+    imgui.PushStyleColor(ImGuiCol_Text, on and TAB.text_on or TAB.text_off)
+    local open
+    if flags and flags ~= 0 then
+        open = imgui.BeginTabItem(label, nil, flags)
+    else
+        open = imgui.BeginTabItem(label)
+    end
+    imgui.PopStyleColor(1)
+    if open then tab_sel[bar] = label end
+    return open
+end
+
+-- Codex scrollbar colors. Returns the number of colors pushed.
+local SCROLL = {
+    bg     = { 0.06, 0.07, 0.10, 0.60 },
+    grab   = { 0.20, 0.18, 0.28, 1.00 },
+    hover  = { 0.30, 0.28, 0.42, 1.00 },
+    active = { 0.40, 0.50, 0.80, 1.00 },
+}
+local function scroll_push()
+    local n = 0
+    local function push(idx, col)
+        if idx ~= nil then imgui.PushStyleColor(idx, col); n = n + 1 end
+    end
+    push(ImGuiCol_ScrollbarBg,          SCROLL.bg)
+    push(ImGuiCol_ScrollbarGrab,        SCROLL.grab)
+    push(ImGuiCol_ScrollbarGrabHovered, SCROLL.hover)
+    push(ImGuiCol_ScrollbarGrabActive,  SCROLL.active)
+    return n
+end
+
+return {
+    UI = UI, SHADOW = SHADOW, SLIDER_W = SLIDER_W,
+    text = text, tip = tip, side = side, note = note, button = button,
+    section_begin = section_begin, section_end = section_end, panel_width = panel_width,
+    rows_begin = rows_begin, row = row, check = check, slider = slider,
+    block_begin = block_begin, block_end = block_end, inner_width = inner_width,
+    frame_begin = frame_begin, frame_end = frame_end, FPAD = FPAD,
+    heading = heading, heading_center = heading_center, rule_after = rule_after,
+    tab_bar_begin = tab_bar_begin, tab_bar_end = tab_bar_end, tab_item = tab_item,
+    tab_selected = function(bar) return tab_sel[bar] end,
+    scroll_push = scroll_push,
+}
+end)()
+
+-- =========================
 -- Theme (mirrors the other Codex windows)
 -- =========================
 local THEME_COLOR_COUNT = 17
+local theme_scroll_stack = {}   -- scrollbar colors pushed per open theme
 
 local function PushWindowTheme(bg_r, bg_g, bg_b, bg_a)
     imgui.PushStyleColor(ImGuiCol_WindowBg,         { bg_r, bg_g, bg_b, bg_a })
@@ -464,8 +928,8 @@ local function PushWindowTheme(bg_r, bg_g, bg_b, bg_a)
     imgui.PushStyleColor(ImGuiCol_Border,           { 0.28, 0.26, 0.38, 0.90 })
     imgui.PushStyleColor(ImGuiCol_FrameBg,          { 0.14, 0.15, 0.20, 1.00 })
     imgui.PushStyleColor(ImGuiCol_FrameBgHovered,   { 0.18, 0.20, 0.28, 1.00 })
-    imgui.PushStyleColor(ImGuiCol_Header,           { 0.22, 0.30, 0.44, 0.65 })
-    imgui.PushStyleColor(ImGuiCol_HeaderHovered,    { 0.26, 0.34, 0.52, 0.75 })
+    imgui.PushStyleColor(ImGuiCol_Header,           { 0.14, 0.13, 0.20, 1.00 })
+    imgui.PushStyleColor(ImGuiCol_HeaderHovered,    { 0.20, 0.18, 0.30, 1.00 })
     imgui.PushStyleColor(ImGuiCol_Button,           { 0.16, 0.18, 0.26, 1.00 })
     imgui.PushStyleColor(ImGuiCol_ButtonHovered,    { 0.24, 0.28, 0.42, 1.00 })
     imgui.PushStyleColor(ImGuiCol_ButtonActive,     { 0.32, 0.38, 0.58, 1.00 })
@@ -478,28 +942,25 @@ local function PushWindowTheme(bg_r, bg_g, bg_b, bg_a)
     imgui.PushStyleVar(ImGuiStyleVar_WindowRounding,   6.0)
     imgui.PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0)
     imgui.PushStyleVar(ImGuiStyleVar_FrameRounding,    4.0)
+
+    -- Codex scrollbar colors (count varies by client; popped in PopWindowTheme).
+    theme_scroll_stack[#theme_scroll_stack + 1] = UIK.scroll_push()
 end
 
 local function PopWindowTheme()
     imgui.PopStyleVar(3)
-    imgui.PopStyleColor(THEME_COLOR_COUNT)
+    local n = table.remove(theme_scroll_stack) or 0
+    imgui.PopStyleColor(THEME_COLOR_COUNT + n)
 end
 
+-- Fixed window background (the colour option was removed).
 local function BgColor()
-    return cfg.bluemage_bg_color_r or 0.06, cfg.bluemage_bg_color_g or 0.07,
-           cfg.bluemage_bg_color_b or 0.10, cfg.bluemage_bg_color_a or 0.96
+    return 0.06, 0.07, 0.10, 0.96
 end
 
 -- =========================
 -- Helpers
 -- =========================
-local function in_game_menu_open()
-    local mm = AshitaCore and AshitaCore:GetMemoryManager()
-    if not mm then return false end
-    local interface = mm:GetInterfaceControl()
-    if not interface then return false end
-    return interface:GetMenuOpen() ~= 0
-end
 
 -- Player's BLU main-job level, or nil if BLU is not the main job. Uses the
 -- party self-slot (index 0), matching how Renkei reads job/level here.
@@ -1015,8 +1476,10 @@ end
 -- Header row (column labels; fixed above the scroll area)
 -- =========================
 local function DrawHeaderRow()
+    -- Indented by the frame inset so the labels line up with the framed list.
+    imgui.Indent(UIK.FPAD)
     SetupColumns('##bm_hdr')
-    imgui.PushStyleColor(ImGuiCol_Text, { 0.60, 0.63, 0.78, 1.0 })
+    imgui.PushStyleColor(ImGuiCol_Text, UIK.UI.label)
     imgui.Text('');         imgui.NextColumn()
     imgui.Text('MRL');      imgui.NextColumn()
     imgui.Text('LVL');      imgui.NextColumn()
@@ -1027,7 +1490,8 @@ local function DrawHeaderRow()
     imgui.Text('Tracking'); imgui.NextColumn()
     imgui.PopStyleColor(1)
     imgui.Columns(1)
-    imgui.Separator()
+    imgui.Unindent(UIK.FPAD)
+    imgui.Dummy({ 0, 1 })   -- same height the old separator took
 end
 
 -- =========================
@@ -1036,12 +1500,14 @@ end
 local function DrawProgressBar(frac, w, h)
     local x, y = imgui.GetCursorScreenPos()
     local dl = imgui.GetWindowDrawList()
-    dl:AddRectFilled({ x, y }, { x + w, y + h }, imgui.GetColorU32({ 0.14, 0.15, 0.20, 1.0 }))
+    -- Codex palette: frame-bg track, accent-blue fill (green when complete),
+    -- panel border, rounded ends. Same footprint as before.
+    dl:AddRectFilled({ x, y }, { x + w, y + h }, imgui.GetColorU32({ 0.14, 0.15, 0.20, 1.0 }), 3.0)
     if frac > 0 then
-        local col = (frac >= 1.0) and { 0.40, 0.85, 0.50, 1.0 } or { 0.35, 0.55, 0.95, 1.0 }
-        dl:AddRectFilled({ x, y }, { x + w * frac, y + h }, imgui.GetColorU32(col))
+        local col = (frac >= 1.0) and { 0.45, 0.85, 0.52, 1.0 } or { 0.40, 0.60, 1.00, 1.0 }
+        dl:AddRectFilled({ x, y }, { x + math.max(h, w * math.min(1, frac)), y + h }, imgui.GetColorU32(col), 3.0)
     end
-    dl:AddRect({ x, y }, { x + w, y + h }, imgui.GetColorU32({ 0.30, 0.33, 0.45, 1.0 }))
+    dl:AddRect({ x, y }, { x + w, y + h }, imgui.GetColorU32(UIK.UI.border), 3.0, 0, 1.0)
     imgui.Dummy({ w, h })
 end
 
@@ -1139,7 +1605,7 @@ local function DrawPlayerMarker(dl, to_screen, ix0, iy0, ix1, iy1, zoneName, flo
     return true
 end
 
-local function DrawMobMap(zoneName, mobName)
+local function DrawMobMapBody(zoneName, mobName)
     local canon = Canon(zoneName)
     local zc = POS[canon]
     if not zc or not zc.mobs then return false end
@@ -1223,15 +1689,7 @@ local function DrawMobMap(zoneName, mobName)
     local MAP_W = math.floor(MAP_BASE * MapScale())
     local MAP_H = MAP_W
 
-    -- Header (auto-sizes the tooltip).
-    imgui.PushStyleColor(ImGuiCol_Text, { 0.85, 0.92, 1.00, 1.0 })
-    imgui.Text(mobName)
-    imgui.PopStyleColor(1)
-    imgui.PushStyleColor(ImGuiCol_Text, { 0.62, 0.66, 0.80, 1.0 })
-    imgui.Text(('%s   -   %d spawn point%s%s'):format(
-        zoneName, #drawPts, (#drawPts == 1) and '' or 's', floorNote or ''))
-    imgui.PopStyleColor(1)
-
+    -- Map only (no text): the tooltip is sized to exactly the map.
     local ox, oy = imgui.GetCursorScreenPos()
     imgui.Dummy({ MAP_W, MAP_H })
     local dl = imgui.GetWindowDrawList()
@@ -1354,13 +1812,24 @@ local function DrawMobMap(zoneName, mobName)
     end
     DrawPlayerMarker(dl, to_screen, ix0, iy0, ix1, iy1, zoneName, floorOk)
 
-    imgui.PushStyleColor(ImGuiCol_Text, { 0.50, 0.54, 0.68, 1.0 })
-    imgui.Text(('center ~ (%d, %d)%s'):format(
-        math.floor(cx + 0.5), math.floor(cz + 0.5),
-        bg_is_live and '   [live map]' or (tex and '   [map]' or '')))
-    imgui.PopStyleColor(1)
-
     return true
+end
+
+-- Hover mini-map tooltip: just the map, filling the whole tooltip (no
+-- padding or tooltip border; the map draws its own rounded border, and the
+-- tooltip's corners are rounded to match). Opens and closes the tooltip.
+local function DrawMobMap(zoneName, mobName)
+    local nv = 0
+    local function pv(idx, v) if idx ~= nil then imgui.PushStyleVar(idx, v); nv = nv + 1 end end
+    pv(ImGuiStyleVar_WindowPadding,   { 0.0, 0.0 })
+    pv(ImGuiStyleVar_PopupBorderSize, 0.0)
+    pv(ImGuiStyleVar_PopupRounding,   6.0)
+    pv(ImGuiStyleVar_WindowRounding,  6.0)
+    imgui.BeginTooltip()
+    local ok, res = pcall(DrawMobMapBody, zoneName, mobName)
+    imgui.EndTooltip()
+    if nv > 0 then imgui.PopStyleVar(nv) end
+    return ok and res
 end
 
 -- =========================
@@ -1369,20 +1838,17 @@ end
 local function DrawDetailPanel()
     local sel = selectedKey and DB.BY_KEY[selectedKey] or nil
 
-    imgui.BeginChild('##bm_detail', { 0, DETAIL_HEIGHT })
+    UIK.frame_begin('##bm_detail', 0, DETAIL_HEIGHT)
 
     if not sel then
-        imgui.PushStyleColor(ImGuiCol_Text, { 0.55, 0.58, 0.72, 1.0 })
+        imgui.PushStyleColor(ImGuiCol_Text, UIK.UI.dim)
         imgui.Text('Click a spell name above to see where to learn it')
         imgui.Text('(monster, level, and zone).')
         imgui.PopStyleColor(1)
-        imgui.EndChild()
+        UIK.frame_end()
         return
     end
 
-    imgui.PushStyleColor(ImGuiCol_Text, { 0.80, 0.90, 1.00, 1.0 })
-    imgui.Text('Learned From:  ' .. sel.name)
-    imgui.PopStyleColor(1)
 
     imgui.PushStyleColor(ImGuiCol_Text, { 0.70, 0.73, 0.85, 1.0 })
     imgui.Text(('Family: %s     Type: %s %s     Usable Lv %d     Learnable Lv %s')
@@ -1390,12 +1856,27 @@ local function DrawDetailPanel()
                 sel.lvl, MRL[sel.key] and tostring(MRL[sel.key]) or '?'))
     imgui.PopStyleColor(1)
 
+    -- Zones hidden because their level cap is below the learn level.
+    local capped = CAPPED_OUT[sel.key]
+    if capped and #capped > 0 then
+        local parts = {}
+        for _, c in ipairs(capped) do parts[#parts + 1] = ('%s (Lv%d cap)'):format(c[1], c[2]) end
+        table.sort(parts)
+        imgui.PushStyleColor(ImGuiCol_Text, { 0.85, 0.55, 0.45, 1.0 })
+        imgui.Text('Not learnable in: ' .. table.concat(parts, ', '))
+        imgui.PopStyleColor(1)
+        if imgui.IsItemHovered() then
+            imgui.SetTooltip(('These zones cap your level below %d, the level\nneeded to learn this spell, so they are hidden.')
+                :format(MRL[sel.key] or 0))
+        end
+    end
+
     local rows = LF.DATA[sel.key]
     if rows and #rows > 0 then
         imgui.Columns(3, '##bm_lf', false)
         imgui.SetColumnWidth(0, 185)   -- room for the "[NM]" tag on notorious monsters
         imgui.SetColumnWidth(1, 60)
-        imgui.PushStyleColor(ImGuiCol_Text, { 0.60, 0.63, 0.78, 1.0 })
+        imgui.PushStyleColor(ImGuiCol_Text, UIK.UI.label)
         imgui.Text('Monster'); imgui.NextColumn()
         imgui.Text('Level');   imgui.NextColumn()
         imgui.Text('Zone');    imgui.NextColumn()
@@ -1409,9 +1890,7 @@ local function DrawDetailPanel()
             -- (only for zones/mobs we have position data for).
             local dzc = POS[Canon(row[3])]
             if imgui.IsItemHovered() and dzc and dzc.mobs[row[1]] then
-                imgui.BeginTooltip()
                 DrawMobMap(row[3], row[1])
-                imgui.EndTooltip()
             end
             imgui.PushStyleColor(ImGuiCol_Text, { 0.70, 0.73, 0.85, 1.0 })
             imgui.Text(row[2]); imgui.NextColumn()
@@ -1430,7 +1909,7 @@ local function DrawDetailPanel()
         imgui.PopStyleColor(1)
     end
 
-    imgui.EndChild()
+    UIK.frame_end()
 end
 
 -- =========================
@@ -1723,6 +2202,70 @@ local function DrawZoneMap(zoneName, mobNames, bottomReserve)
     return true
 end
 
+-- Per-monster breakdown of the seen counts: SeenBy.data[key][mob] = n.
+-- Persisted as one self-encoded string (cfg.bluemage_seenby_str), like the
+-- floor cache, so mob names with spaces/apostrophes survive the settings
+-- serializer. Only filled from action packets (0x028) read while BLU is
+-- your main job; the chat-only fallback never adds to it.
+local SeenBy = { data = {} }
+function SeenBy.clean(mob)
+    if type(mob) ~= 'string' then return nil end
+    mob = mob:gsub('^[Tt]he ', ''):gsub('[|;]', ''):gsub('^%s+', ''):gsub('%s+$', '')
+    if mob == '' then return nil end
+    return mob
+end
+function SeenBy.add(key, mob)
+    mob = SeenBy.clean(mob)
+    if not mob then return end
+    local t = SeenBy.data[key]
+    if not t then t = {}; SeenBy.data[key] = t end
+    t[mob] = (t[mob] or 0) + 1
+end
+function SeenBy.encode()
+    local recs = {}
+    for key, mobs in pairs(SeenBy.data) do
+        for mob, n in pairs(mobs) do
+            if n > 0 then recs[#recs + 1] = key .. '|' .. mob .. '|' .. tostring(n) end
+        end
+    end
+    table.sort(recs)
+    return table.concat(recs, ';')
+end
+function SeenBy.decode(str)
+    local out = {}
+    if type(str) ~= 'string' or str == '' then return out end
+    for rec in (str .. ';'):gmatch('([^;]*);') do
+        local key, mob, n = rec:match('^([^|]+)|([^|]+)|(%d+)$')
+        if key then
+            out[key] = out[key] or {}
+            out[key][mob] = tonumber(n)
+        end
+    end
+    return out
+end
+-- Is this spell learned right now? Reads the spellbook live for just this
+-- spell (the cached `learned` flags only refresh every ~0.5s), updates the
+-- cache, and falls back to the cache if the spellbook can't be read.
+function SeenBy.is_learned(key)
+    if spellbook_ok then
+        local ok, has = pcall(function()
+            local sid = SID[key]
+            local player = sid and AshitaCore:GetMemoryManager():GetPlayer()
+            if not player then return nil end
+            return player:HasSpell(sid) and true or false
+        end)
+        if ok and has ~= nil then
+            if learned then learned[key] = has end
+            return has
+        end
+    end
+    return (learned and learned[key]) and true or false
+end
+
+function SeenBy.store()
+    if cfg then cfg.bluemage_seenby_str = SeenBy.encode() end
+end
+
 -- =========================
 -- Module API
 -- =========================
@@ -1746,6 +2289,12 @@ function M.init(host)
     if not cfg.bluemage_track_data then cfg.bluemage_track_data = M.default_track end
     if not cfg.bluemage_track_data.tracked then cfg.bluemage_track_data.tracked = T{} end
     tracked = cfg.bluemage_track_data.tracked
+
+    -- Bind the "seen in chat" counters (persisted with the tracked spells).
+    if not cfg.bluemage_track_data.seen then cfg.bluemage_track_data.seen = T{} end
+    seen = cfg.bluemage_track_data.seen
+    SeenBy.data = SeenBy.decode(cfg.bluemage_seenby_str)
+    M.reset_seen_session()
 
     -- Make sure every known spell has an entry (handles data additions).
     for _, r in ipairs(DB.SPELLS) do
@@ -1785,6 +2334,537 @@ function M.init(host)
 end
 
 -- =========================
+-- "Seen in chat" counter
+-- Counts each time a monster is seen using a Blue Magic ability in the chat
+-- log while BLU is your main job, e.g.
+--     "The Mandragora readies Head Butt."
+--     "The Mandragora uses Head Butt. Kalrir takes 20 points of damage."
+-- A "readies" line and the "uses" line that follows it are paired so one use
+-- counts once, whichever of the two lines your chat filters let through.
+--
+-- Only uses you could actually learn from are counted. The game's action
+-- packet (0x028) says exactly WHICH monster performed each TP move, so two
+-- mobs with the same name are never confused:
+--   * each category 11 packet (monster finished a TP move) counts once, with a
+--     verdict from THAT monster's claim: claimed by you or your party/alliance
+--     -> counts; claimed by an outsider -> ignored; unclaimed -> counts only if
+--     the move targets you or a party/alliance member.
+--   * the ability name comes from the client's monster-ability table, so chat
+--     formatting (battle-log addons) doesn't matter.
+--   * if that name can't be read, the next chat line naming the monster and a
+--     Blue Magic ability (any format) supplies it.
+--   * if action packets can't be read at all, it falls back to parsing the
+--     game's own "readies"/"uses" chat lines.
+--   * once a spell is learned its count stops (frozen at its final value).
+-- =========================
+local SEEN_PAIR_WINDOW = 12.0   -- seconds a "readies" waits for its "uses"
+local SEEN_DUP_WINDOW  = 1.5    -- ignore repeat "uses" lines from the same actor
+local SEEN_SAVE_EVERY  = 15.0   -- seconds between throttled saves of the counts
+
+local SEEN_PATTERNS = nil       -- array of { lowercased name, key }, longest first
+local SEEN_EXACT    = nil       -- lowercased name -> key (for packet ability names)
+local seen_pending  = {}        -- 'actor|key' -> { n = readies not yet used, t = clock }
+local seen_lastuse  = {}        -- 'actor|key' -> clock of the last counted/paired "uses"
+local seen_dirty     = false
+local seen_last_save = 0
+
+local SEEN_ACTION_WINDOW = 6.0  -- seconds a queued action packet waits for its chat line
+local SEEN_ACTION_MAX    = 48   -- cap on queued actions
+local seen_actions  = {}        -- FIFO of { id, name, verb, ok, t } from 0x028 packets
+local packets_working = false   -- true once a monster TP action packet has been parsed
+local seen_recent   = {}        -- recent chat lines { text, t } awaiting a late packet
+local SEEN_RECENT_WINDOW = 3.0
+local SEEN_RECENT_MAX    = 8
+local seen_debug    = false     -- /blutracker seen debug
+
+local function BuildSeenPatterns()
+    local list, exact = {}, {}
+    local function add(name, key)
+        if type(name) == 'string' and name ~= '' then
+            list[#list + 1] = { name:lower(), key }
+            exact[name:lower()] = key
+        end
+    end
+    for _, r in ipairs(DB.SPELLS) do
+        add(r.name, r.key)
+        if r.aliases then for _, a in ipairs(r.aliases) do add(a, r.key) end end
+        local extra = MOBMOVES[r.key]
+        if type(extra) == 'string' then add(extra, r.key)
+        elseif type(extra) == 'table' then for _, a in ipairs(extra) do add(a, r.key) end end
+    end
+    -- Longest first so e.g. "Blood Saber" never matches as a shorter name.
+    table.sort(list, function(a, b) return #a[1] > #b[1] end)
+    SEEN_PATTERNS = list
+    SEEN_EXACT    = exact
+end
+
+-- Clear the per-session pairing state (called on init / zone-in).
+function M.reset_seen_session()
+    seen_pending = {}
+    seen_lastuse = {}
+    seen_actions = {}
+    seen_recent  = {}
+end
+
+-- Split a battle line into actor / verb / remainder, or nil if it isn't one.
+-- Player chat ("(Name) ...", "<Name> ...", "Name : ...", ">>Name ...") is
+-- rejected by requiring the actor to look like a plain entity name.
+local function ParseSeenLine(clean)
+    local s = clean:gsub('^%[[%d:]+%]%s*', '')   -- tolerate a leading [hh:mm:ss]
+    local actor, rest = s:match('^(.-) uses (.+)$')
+    local verb = 'uses'
+    if not actor then
+        actor, rest = s:match('^(.-) readies (.+)$')
+        verb = 'readies'
+    end
+    if not actor or actor == '' then return nil end
+    if #actor > 48 or not actor:match("^%a[%a%d%s'%-%.]*$") then return nil end
+    return actor, verb, rest
+end
+
+local function MatchSeenAbility(rest)
+    if not SEEN_PATTERNS then BuildSeenPatterns() end
+    local rl = rest:lower()
+    for _, p in ipairs(SEEN_PATTERNS) do
+        local pat = p[1]
+        if rl:sub(1, #pat) == pat then
+            local nxt = rl:sub(#pat + 1, #pat + 1)
+            if nxt == '' or not nxt:match('%w') then return p[2] end
+        end
+    end
+    return nil
+end
+
+-- Party/alliance snapshot: set of low-16-bit server ids (for claim), lowercased
+-- names, and set of full server ids (for action targets).
+local function PartySnapshot()
+    local ids, names, full = {}, {}, {}
+    local mm = AshitaCore and AshitaCore:GetMemoryManager()
+    local party = mm and mm:GetParty()
+    if not party then return ids, names, full end
+    for i = 0, 17 do
+        local ok, active, sid, name = pcall(function()
+            return party:GetMemberIsActive(i), party:GetMemberServerId(i), party:GetMemberName(i)
+        end)
+        local okt, tidx = pcall(function() return party:GetMemberTargetIndex(i) end)
+        if not okt then tidx = nil end
+        if ok and (active == true or (type(active) == 'number' and active ~= 0)) then
+            if type(sid) == 'number' and sid ~= 0 then
+                ids[sid % 0x10000] = true
+                full[sid] = true
+            end
+            if type(name) == 'string' and name ~= '' then names[#names + 1] = name:lower() end
+            -- Some clients store the claimer as a target index rather than an id.
+            if type(tidx) == 'number' and tidx ~= 0 then ids[tidx % 0x10000] = true end
+        end
+    end
+    return ids, names, full
+end
+
+-- Who has the monster that performed the move?
+--   'party'   : a same-named mob nearby is claimed by you / your party / alliance
+--   'other'   : every same-named mob found is claimed by someone outside it
+--   'unknown' : not found, unclaimed, or the claim couldn't be read
+local function ActorClaimState(actor, party_ids)
+    local mm = AshitaCore and AshitaCore:GetMemoryManager()
+    local ent = mm and mm:GetEntity()
+    if not ent then return 'unknown' end
+    local name = actor:gsub('^[Tt]he ', '')
+    local saw_other, saw_open = false, false
+    for i = 1, 1023 do   -- NPC / monster entity range
+        local ok, n = pcall(function() return ent:GetName(i) end)
+        if ok and n == name then
+            local okc, claim = pcall(function() return ent:GetClaimStatus(i) end)
+            if okc and type(claim) == 'number' and claim ~= 0 then
+                if party_ids[claim % 0x10000] then return 'party' end
+                saw_other = true
+            else
+                saw_open = true
+            end
+        end
+    end
+    if saw_other and not saw_open then return 'other' end
+    return 'unknown'
+end
+
+-- Does the result text name you or a party/alliance member?
+-- e.g. "Kalrir takes 20 points of damage." / "but misses Kalrir." / "Kalrir is asleep."
+local function NamesPartyMember(rest, party_names)
+    local rl = rest:lower()
+    for _, n in ipairs(party_names) do
+        if rl:find('%f[%a]' .. n .. '%f[%A]') then return true end
+    end
+    return false
+end
+
+local function BumpSeen(key, mob)
+    -- Final guard for every counting path: a learned spell's count is frozen.
+    if SeenBy.is_learned(key) then return end
+    seen[key] = (tonumber(seen[key]) or 0) + 1
+    if mob then
+        SeenBy.add(key, mob)
+        -- Keep the encoded copy in cfg current so ANY settings.save (unload,
+        -- zoning, a toggle) persists it, not just the throttled flush.
+        SeenBy.store()
+    end
+    seen_dirty = true
+end
+
+-- ---------- Action packet (0x028) ----------
+-- FFXI packs the action packet as a little-endian bit stream: bit k is bit
+-- (k % 8) of byte floor(k / 8). Offsets below are from the start of the
+-- packet (header included), matching e.data.
+local POW2 = {}
+for i = 0, 32 do POW2[i] = 2 ^ i end
+
+local function BitReader(data, start)
+    local pos = start
+    return function(n)
+        local v = 0
+        for i = 0, n - 1 do
+            local k = pos + i
+            local b = data:byte(math.floor(k / 8) + 1) or 0
+            if math.floor(b / POW2[k % 8]) % 2 == 1 then v = v + POW2[i] end
+        end
+        pos = pos + n
+        return v
+    end
+end
+
+-- Parse what we need: actor, category, ability id and every target id.
+local function ParseAction(data)
+    if type(data) ~= 'string' or #data < 20 then return nil end
+    local rd = BitReader(data, 40)
+    local actor  = rd(32)          -- 0x05
+    local ntarg  = rd(6); rd(4)    -- 0x09
+    local cat    = rd(4)           -- 0x0A:2
+    if cat ~= 11 then return { actor = actor, cat = cat } end   -- header only
+    local param  = rd(16)          -- 0x0C:6  (ability id for category 11)
+    rd(16); rd(32)                 -- unknown, recast -> bit 150
+    local targets, first_param = {}, nil
+    for _ = 1, math.min(ntarg, 32) do
+        targets[#targets + 1] = rd(32)
+        local nact = rd(4)
+        for _ = 1, nact do
+            rd(5); rd(12); rd(7); rd(3)
+            local ap = rd(17)
+            if first_param == nil then first_param = ap end
+            rd(10); rd(31)
+            if rd(1) == 1 then rd(10); rd(17); rd(10) end   -- additional effect
+            if rd(1) == 1 then rd(10); rd(14); rd(10) end   -- spikes
+        end
+    end
+    return { actor = actor, cat = cat, param = param, first_param = first_param, targets = targets }
+end
+
+-- Entity index for a server id (fast path: low 12 bits for monsters).
+local function IndexOfServerId(ent, sid)
+    local guess = sid % 0x1000
+    local ok, v = pcall(function() return ent:GetServerId(guess) end)
+    if ok and v == sid then return guess end
+    for i = 1, 0x8FF do
+        local ok2, v2 = pcall(function() return ent:GetServerId(i) end)
+        if ok2 and v2 == sid then return i end
+    end
+    return nil
+end
+
+local function SeenDbg(fmt, ...)
+    if seen_debug then print('[BluTracker:seen] ' .. fmt:format(...)) end
+end
+
+-- ---------- Ability id -> name (client resource table) ----------
+-- Reading the name from the client's own monster-ability table means the
+-- counter works however your chat log is formatted (battle-log addons etc).
+-- Monster ability ids in the packet start at 256; the resource table is
+-- normally 0-based from there. The offset is confirmed once against known
+-- entries; if that can't be confirmed, both are tried.
+local abil_cache  = {}      -- id -> { key|false, name|nil }
+local abil_offset = nil     -- 256, 0, or false (unknown -> try both)
+
+local function ResAbilityName(idx)
+    if idx < 0 then return nil end
+    local ok, s = pcall(function()
+        return AshitaCore:GetResourceManager():GetString('monsters.abilities', idx)
+    end)
+    if not ok or type(s) ~= 'string' then return nil end
+    s = s:gsub('%z.*$', ''):gsub('^%s+', ''):gsub('%s+$', '')
+    if s == '' then return nil end
+    return s
+end
+
+local function CalibrateAbilityOffset()
+    if abil_offset ~= nil then return abil_offset end
+    local function is(idx, want) local n = ResAbilityName(idx); return n and n:lower() == want end
+    if is(1, 'foot kick') or is(2, 'dust cloud') then abil_offset = 256
+    elseif is(257, 'foot kick') or is(258, 'dust cloud') then abil_offset = 0
+    else abil_offset = false end
+    return abil_offset
+end
+
+local function AbilityFromId(id)
+    if type(id) ~= 'number' or id <= 0 then return nil, nil end
+    local c = abil_cache[id]
+    if c then return c[1] or nil, c[2] end
+    if not SEEN_EXACT then BuildSeenPatterns() end
+    local off = CalibrateAbilityOffset()
+    local tries = (off == 256 and { id - 256 }) or (off == 0 and { id }) or { id - 256, id }
+    local key, name = nil, nil
+    for _, idx in ipairs(tries) do
+        local n = ResAbilityName(idx)
+        if n then
+            name = name or n
+            local k = SEEN_EXACT[n:lower()]
+            if k then key, name = k, n; break end
+        end
+    end
+    abil_cache[id] = { key or false, name }
+    return key, name
+end
+
+-- ---------- Claim verdict for one specific monster ----------
+local function ClaimVerdict(ent, idx, targets)
+    local party_ids, _, party_full = PartySnapshot()
+    local okc, claim = pcall(function() return ent:GetClaimStatus(idx) end)
+    if okc and type(claim) == 'number' and claim ~= 0 then
+        if party_ids[claim % 0x10000] then return true, ('claim 0x%X = party'):format(claim) end
+        return false, ('claim 0x%X = not your party'):format(claim)
+    end
+    for _, t in ipairs(targets) do
+        if party_full[t] then return true, 'unclaimed, targets your party' end
+    end
+    return false, 'unclaimed, not targeting your party'
+end
+
+-- ---------- Chat fallback (only if the ability name can't be read) ----------
+local function FindWord(hay, needle, from)
+    local i = from or 1
+    while true do
+        local a, b = hay:find(needle, i, true)
+        if not a then return nil end
+        local pre  = (a > 1) and hay:sub(a - 1, a - 1) or ''
+        local post = hay:sub(b + 1, b + 1)
+        if not pre:match('%w') and not post:match('%w') then return a, b end
+        i = a + 1
+    end
+end
+
+-- Format-agnostic: the line must contain the monster's name and, after it,
+-- a Blue Magic ability name. Works with "The X uses Y.", "[X] Y", "X Y", ...
+local function LineMatchesAction(lc, a)
+    local _, nb = FindWord(lc, a.name)
+    if not nb then return nil end
+    if not SEEN_PATTERNS then BuildSeenPatterns() end
+    for _, p in ipairs(SEEN_PATTERNS) do
+        if FindWord(lc, p[1], nb + 1) then return p[2] end
+    end
+    return nil
+end
+
+local function ApplyChatMatch(a, key)
+    if SeenBy.is_learned(key) then
+        SeenDbg('%s -> %s: already learned, not counted', a.name, key)
+    elseif a.ok then
+        BumpSeen(key, a.disp or a.name)
+        SeenDbg('%s -> %s: counted via chat (%s)', a.name, key, a.why)
+    else
+        SeenDbg('%s -> %s: not counted (%s)', a.name, key, a.why)
+    end
+end
+
+function M.packet_in(e)
+    if e.id ~= 0x028 or not seen then return end
+    if GetBluLevel() == nil then return end
+    local a = ParseAction(e.data)
+    if not a or a.actor < 0x1000000 then return end   -- monsters/NPCs only
+
+    local mm  = AshitaCore and AshitaCore:GetMemoryManager()
+    local ent = mm and mm:GetEntity()
+    if not ent then return end
+
+    if a.cat ~= 11 then
+        -- Any readable monster action (melee, readies, ...) proves packets work,
+        -- so chat isn't parsed the old way before the first TP move finishes.
+        if not packets_working then
+            local ok, v = pcall(function() return ent:GetServerId(a.actor % 0x1000) end)
+            if ok and v == a.actor then packets_working = true end
+        end
+        return                                         -- count finished moves only
+    end
+    local idx = IndexOfServerId(ent, a.actor)
+    if not idx then return end
+    local okn, name = pcall(function() return ent:GetName(idx) end)
+    if not okn or type(name) ~= 'string' or name == '' then return end
+    packets_working = true
+
+    local ok_party, why = ClaimVerdict(ent, idx, a.targets)
+    local key, aname = AbilityFromId(a.param)
+
+    if key then
+        if SeenBy.is_learned(key) then
+            SeenDbg('%s used %s (#%d): already learned, not counted', name, aname, a.param)
+        elseif ok_party then
+            BumpSeen(key, name)
+            SeenDbg('%s used %s (#%d): counted (%s)', name, aname, a.param, why)
+        else
+            SeenDbg('%s used %s (#%d): not counted (%s)', name, aname, a.param, why)
+        end
+        return
+    end
+    if aname then return end   -- read fine, just not a Blue Magic ability
+
+    -- Name unreadable: hand this action to the chat matcher.
+    SeenDbg('%s used ability #%d (name unreadable, waiting for chat line)', name, a.param)
+    local now = os.clock()
+    local keep = {}
+    for _, q in ipairs(seen_actions) do
+        if (now - q.t) <= SEEN_ACTION_WINDOW then keep[#keep + 1] = q end
+    end
+    while #keep >= SEEN_ACTION_MAX do table.remove(keep, 1) end
+    local entry = { id = a.actor, name = name:lower(), disp = name, ok = ok_party, why = why, t = now }
+    seen_actions = keep
+
+    -- A battle-log addon may have printed its line before this packet reached us.
+    for i, l in ipairs(seen_recent) do
+        if (now - l.t) <= SEEN_RECENT_WINDOW then
+            local k = LineMatchesAction(l.text, entry)
+            if k then
+                table.remove(seen_recent, i)
+                ApplyChatMatch(entry, k)
+                return
+            end
+        end
+    end
+    seen_actions[#seen_actions + 1] = entry
+end
+
+local function CountSeen(e)
+    if not seen then return end
+    if GetBluLevel() == nil then return end          -- only while BLU is main job
+    local clean = CleanText(e.message or e.message_modified or '')
+    if clean == '' then return end
+
+    if packets_working then
+        -- Normally the packet already counted it. This only matters when the
+        -- ability name couldn't be read from the packet.
+        local lc  = clean:lower()
+        local now = os.clock()
+        for i, a in ipairs(seen_actions) do
+            if (now - a.t) <= SEEN_ACTION_WINDOW then
+                local k = LineMatchesAction(lc, a)
+                if k then
+                    table.remove(seen_actions, i)
+                    ApplyChatMatch(a, k)
+                    return
+                end
+            end
+        end
+        -- Keep it briefly in case its packet arrives right after.
+        local keep = {}
+        for _, l in ipairs(seen_recent) do
+            if (now - l.t) <= SEEN_RECENT_WINDOW then keep[#keep + 1] = l end
+        end
+        while #keep >= SEEN_RECENT_MAX do table.remove(keep, 1) end
+        keep[#keep + 1] = { text = lc, t = now }
+        seen_recent = keep
+        return
+    end
+
+    -- ---- Legacy path: action packets unreadable on this client ----
+    local lc = clean:lower()
+    if not lc:find(' uses ', 1, true) and not lc:find(' readies ', 1, true) then return end
+
+    local actor, verb, rest = ParseSeenLine(clean)
+    if not actor then return end
+    local key = MatchSeenAbility(rest)
+    if not key then return end
+
+    -- Stop counting once the spell is learned (the count stays frozen).
+    if SeenBy.is_learned(key) then return end
+
+    local party_ids, party_names = PartySnapshot()
+    local claim = ActorClaimState(actor, party_ids)
+    if claim == 'other' then return end
+    if claim == 'unknown' and not NamesPartyMember(rest, party_names) then return end
+    local id = actor:lower() .. '|' .. key
+
+    local now = os.clock()
+    if verb == 'readies' then
+        local p = seen_pending[id]
+        if p and (now - p.t) <= SEEN_PAIR_WINDOW then
+            p.n = p.n + 1; p.t = now
+        else
+            seen_pending[id] = { n = 1, t = now }
+        end
+        BumpSeen(key)   -- chat only (no packet): not recorded per monster
+    else
+        -- A "uses" that completes an earlier "readies" was already counted.
+        local p = seen_pending[id]
+        if p and p.n > 0 and (now - p.t) <= SEEN_PAIR_WINDOW then
+            p.n = p.n - 1
+            if p.n <= 0 then seen_pending[id] = nil end
+            seen_lastuse[id] = now
+            return
+        end
+        local lu = seen_lastuse[id]
+        if lu and (now - lu) < SEEN_DUP_WINDOW then return end
+        seen_lastuse[id] = now
+        BumpSeen(key)   -- chat only (no packet): not recorded per monster
+    end
+end
+
+-- Throttled save so a busy fight doesn't rewrite the settings file per line.
+local function FlushSeen(force)
+    if not seen_dirty or not settings then return end
+    local now = os.clock()
+    if force or (now - seen_last_save) >= SEEN_SAVE_EVERY then
+        seen_dirty = false
+        seen_last_save = now
+        SeenBy.store()
+        settings.save()
+    end
+end
+
+-- Accepts either (x, y) or a vec2 table from the imgui binding.
+local function vec2(a, b)
+    if type(a) == 'table' then return a[1] or a.x or 0, a[2] or a.y or 0 end
+    return a or 0, b or 0
+end
+
+-- Right-aligned "xN" on the row of the item just drawn (the tracker header).
+-- Drawn on the draw list so it doesn't change the row layout or click area.
+local function DrawSeenCount(key)
+    local n = (seen and tonumber(seen[key])) or 0
+    local isL = learned and learned[key]
+    local txt = 'x' .. tostring(n)
+    local ok, x0, x1, tw = pcall(function()
+        local ax, ay = vec2(imgui.GetItemRectMin())
+        local bx, by = vec2(imgui.GetItemRectMax())
+        local w = imgui.CalcTextSize(txt)
+        if type(w) ~= 'number' then w = #txt * 7 end
+        local lh = imgui.GetTextLineHeight() or 13
+        local col
+        if isL then          col = u32(0.40, 0.55, 0.40, 0.85)   -- learned: frozen, muted green
+        elseif n > 0 then    col = u32(0.55, 0.85, 1.00, 1.0)
+        else                 col = u32(0.45, 0.48, 0.60, 0.85) end
+        imgui.GetWindowDrawList():AddText({ bx - w - 6, ay + ((by - ay) - lh) * 0.5 }, col, txt)
+        return bx - w - 6, bx, w
+    end)
+    if ok and imgui.IsItemHovered() then
+        local mx = vec2(imgui.GetMousePos())
+        if type(mx) == 'number' and mx >= x0 - 4 and mx <= x1 then
+            if isL then
+                imgui.SetTooltip(('Learned - counting stopped (seen %d time%s before learning)')
+                    :format(n, n == 1 and '' or 's'))
+            else
+                imgui.SetTooltip(('Seen %d time%s in chat while on BLU\n(your party / alliance\'s monsters only)')
+                    :format(n, n == 1 and '' or 's'))
+            end
+        end
+    end
+end
+
+-- =========================
 -- Separate "tracker" window
 -- =========================
 local TRACK_WIN_W = 440
@@ -1815,6 +2895,7 @@ local function TrackerEntry(r, bluLvl, skill, mobs, show_zone, zone_name)
         trk_expanded[r.key] = not open
     end
     imgui.PopStyleColor(1)
+    if cfg.bluemage_show_seen ~= false then DrawSeenCount(r.key) end
 
     if not open then return end
     if #mobs == 0 then
@@ -1870,7 +2951,7 @@ local function TrackerEntry(r, bluLvl, skill, mobs, show_zone, zone_name)
                 local zn = m[3] or zone_name
                 local hzc = zn and POS[Canon(zn)]
                 if imgui.IsItemHovered() and hzc and hzc.mobs[m[1]] then
-                    imgui.BeginTooltip(); DrawMobMap(zn, m[1]); imgui.EndTooltip()
+                    DrawMobMap(zn, m[1])
                 end
             end
             imgui.SameLine(lvl_x, 0)
@@ -1893,7 +2974,7 @@ local function TrackerEntry(r, bluLvl, skill, mobs, show_zone, zone_name)
                 local zn = m[3] or zone_name
                 local hzc = zn and POS[Canon(zn)]
                 if imgui.IsItemHovered() and hzc and hzc.mobs[m[1]] then
-                    imgui.BeginTooltip(); DrawMobMap(zn, m[1]); imgui.EndTooltip()
+                    DrawMobMap(zn, m[1])
                 end
             end
             imgui.SameLine(lvl_x, 0)
@@ -1909,32 +2990,42 @@ local function RenderTracker()
     if not tracked or not learned then return end
     local mode = cfg.bluemage_track_mode or 'off'
     if mode == 'off' then return end
-    if cfg.bluemage_hide_on_menu and in_game_menu_open() then return end
 
     imgui.SetNextWindowSize({ TRACK_WIN_W, TRACK_WIN_H }, ImGuiCond_FirstUseEver)
     imgui.SetNextWindowPos({ cfg.bluemage_track_win_x or 910, cfg.bluemage_track_win_y or 200 }, ImGuiCond_FirstUseEver)
 
     PushWindowTheme(BgColor())
-    local flags = 0
+    -- Thinner scrollbars in the mini window (popped after End).
+    imgui.PushStyleVar(ImGuiStyleVar_ScrollbarSize, 8.0)
+    local flags = bit.bor(ImGuiWindowFlags_NoScrollbar, ImGuiWindowFlags_NoScrollWithMouse or 0)
     if cfg.bluemage_lock_ui then
         flags = bit.bor(flags, ImGuiWindowFlags_NoMove, ImGuiWindowFlags_NoResize)
     end
 
     local visible = { true }
     local begin_ok = imgui.Begin('Blue Magic Tracker', visible, flags)
+    pcall(function() if (imgui.GetScrollY() or 0) ~= 0 then imgui.SetScrollY(0) end end)
+
+    -- Title-bar gear (drawn even when collapsed): toggles the main window,
+    -- reopening it on the tab you were on last (cfg.bluemage_last_tab).
+    if helpers and helpers.draw_titlebar_gear then
+        helpers.draw_titlebar_gear('blutrk', 1.0, function()
+            cfg.bluemage_open = not cfg.bluemage_open
+            if vt then
+                if vt.cfg_bluemage_open then vt.cfg_bluemage_open[1] = cfg.bluemage_open end
+                if cfg.bluemage_open then vt._want_tab = cfg.bluemage_last_tab or 'Spells' end
+            end
+            settings.save()
+        end)
+    end
     if begin_ok then
         local bluLvl = GetBluLevel()
         local skill  = GetBlueSkill()
 
         if mode == 'specific' then
-            imgui.PushStyleColor(ImGuiCol_Text, { 0.80, 0.90, 1.00, 1.0 })
-            imgui.Text('Tracked spells')
-            imgui.PopStyleColor(1)
-            imgui.PushStyleColor(ImGuiCol_Text, { 0.50, 0.53, 0.66, 1.0 })
-            imgui.Text('click a spell to list every mob / zone')
-            imgui.PopStyleColor(1)
-            imgui.Separator()
-            imgui.BeginChild('##bm_trk_list', { 0, 0 })
+            UIK.heading_center('Tracked Spells')
+            imgui.Dummy({ 0, 1 })   -- (was a separator; keeps the same spacing)
+            UIK.frame_begin('##bm_trk_list', 0, 0)
             local any = false
             for _, r in ipairs(SORTED) do
                 if tracked[r.key] then
@@ -1945,21 +3036,16 @@ local function RenderTracker()
             if not any then
                 imgui.PushStyleColor(ImGuiCol_Text, { 0.55, 0.58, 0.72, 1.0 })
                 imgui.Text('No spells tracked yet.')
-                imgui.Text('Tick the "Trk" column in the main list.')
                 imgui.PopStyleColor(1)
             end
-            imgui.EndChild()
+            UIK.frame_end()
 
         elseif mode == 'zone' then
             local zid, zname = GetCurrentZone()
-            imgui.PushStyleColor(ImGuiCol_Text, { 0.80, 0.90, 1.00, 1.0 })
-            imgui.Text('Learnable in current zone')
-            imgui.PopStyleColor(1)
-            imgui.PushStyleColor(ImGuiCol_Text, { 0.72, 0.82, 0.72, 1.0 })
-            imgui.Text(zname or ('Zone ' .. tostring(zid or '?') .. ' (not catalogued)'))
-            imgui.PopStyleColor(1)
-            imgui.Separator()
-            imgui.BeginChild('##bm_trk_list', { 0, 0 })
+            -- The zone name is the title line, centered between two rules.
+            UIK.heading_center(zname or ('Zone ' .. tostring(zid or '?') .. ' (not catalogued)'))
+            imgui.Dummy({ 0, 1 })   -- (was a separator; keeps the same spacing)
+            UIK.frame_begin('##bm_trk_list', 0, 0)
             local list = SpellsInZone(zname)
             if #list == 0 then
                 imgui.PushStyleColor(ImGuiCol_Text, { 0.55, 0.58, 0.72, 1.0 })
@@ -1970,7 +3056,7 @@ local function RenderTracker()
                     TrackerEntry(item.rec, bluLvl, skill, item.mobs, false, zname)
                 end
             end
-            imgui.EndChild()
+            UIK.frame_end()
         end
 
         -- Persist window position.
@@ -1985,6 +3071,7 @@ local function RenderTracker()
         end
     end
     imgui.End()
+    imgui.PopStyleVar(1)   -- ScrollbarSize
     PopWindowTheme()
 
     -- Closing the tracker window turns tracking off.
@@ -2023,9 +3110,7 @@ local function RenderZoneTab()
         zoneTabSpellKey = nil
     end
 
-    imgui.PushStyleColor(ImGuiCol_Text, { 0.80, 0.90, 1.00, 1.0 })
-    imgui.Text('Search Blue Magic by zone')
-    imgui.PopStyleColor(1)
+    UIK.heading_center('Search Blue Magic by zone')
 
     -- ---- Zone picker: click the dropdown and just start typing to filter.
     -- The filter lives inside the dropdown and grabs focus on open. No inner
@@ -2050,8 +3135,8 @@ local function RenderZoneTab()
         imgui.EndCombo()
     end
     imgui.SameLine(0, 8)
-    imgui.PushStyleColor(ImGuiCol_Button,        { 0.18, 0.24, 0.34, 1.0 })
-    imgui.PushStyleColor(ImGuiCol_ButtonHovered, { 0.24, 0.32, 0.46, 1.0 })
+    imgui.PushStyleColor(ImGuiCol_Button,        UIK.UI.btn)
+    imgui.PushStyleColor(ImGuiCol_ButtonHovered, UIK.UI.btn_hov)
     if imgui.Button('Current zone') then
         local _, zn = GetCurrentZone()
         if zn then
@@ -2079,25 +3164,13 @@ local function RenderZoneTab()
     local zhl = { zoneTabHideLearned[1] }
     if imgui.Checkbox('Hide learned##zone', zhl) then zoneTabHideLearned[1] = zhl[1] end
 
-    imgui.Separator()
+    imgui.Dummy({ 0, 1 })   -- (was a separator; keeps the same spacing)
 
     if not zoneTabZone then
         imgui.PushStyleColor(ImGuiCol_Text, { 0.55, 0.58, 0.72, 1.0 })
         imgui.Text('Pick a zone to see which Blue Magic you can learn there.')
         imgui.PopStyleColor(1)
         return
-    end
-
-    -- Zone (+ floor) name + "you are here" hint.
-    local _, curZone = GetCurrentZone()
-    imgui.PushStyleColor(ImGuiCol_Text, { 0.72, 0.82, 0.72, 1.0 })
-    imgui.Text(CurrentZoneLabel())
-    imgui.PopStyleColor(1)
-    if curZone and Canon(curZone) == Canon(zoneTabZone) then
-        imgui.SameLine(0, 8)
-        imgui.PushStyleColor(ImGuiCol_Text, { 0.55, 0.85, 1.00, 1.0 })
-        imgui.Text('(you are here)')
-        imgui.PopStyleColor(1)
     end
 
     local bluLvl = GetBluLevel()
@@ -2112,10 +3185,11 @@ local function RenderZoneTab()
         local ok, _, h = pcall(function() return imgui.GetContentRegionAvail() end)
         if ok and type(h) == 'number' and h > 0 then bodyH = h end
     end
+    bodyH = bodyH - UIK.SHADOW   -- keep the panels' drop shadow inside the window
     if bodyH < 120 then bodyH = 120 end
     local LEFT_W = 270
 
-    imgui.BeginChild('##bm_zone_list', { LEFT_W, bodyH })
+    UIK.frame_begin('##bm_zone_list', LEFT_W, bodyH)
     if #list == 0 then
         imgui.PushStyleColor(ImGuiCol_Text, { 0.55, 0.58, 0.72, 1.0 })
         imgui.Text('No Blue Magic is learnable here')
@@ -2138,11 +3212,11 @@ local function RenderZoneTab()
             end
         end
     end
-    imgui.EndChild()
+    UIK.frame_end()
 
     imgui.SameLine(0, 8)
 
-    imgui.BeginChild('##bm_zone_map_pane', { 0, bodyH })
+    UIK.frame_begin('##bm_zone_map_pane', 0, bodyH)
     -- Build the mob set to plot: the selected spell's mobs here, else every
     -- learnable spell's mobs in this zone.
     local mobNames = {}
@@ -2204,15 +3278,16 @@ local function RenderZoneTab()
 
     DrawZoneMap(zoneTabZone, mobNames, reserve)
 
-    -- Divider under the map: a line drawn in the map panel's own background
-    -- colour (same { 0.07, 0.08, 0.12 } navy used for the map fill).
+    -- Divider under the map: a spacer line drawn in the surrounding panel's
+    -- fill colour.
     do
         imgui.Dummy({ 0, 3 })
         local dl = imgui.GetWindowDrawList()
         local x, y = imgui.GetCursorScreenPos()
         local w = 300
         pcall(function() local aw = imgui.GetContentRegionAvail(); if type(aw) == 'number' and aw > 0 then w = aw end end)
-        dl:AddLine({ x, y }, { x + w, y }, u32(0.07, 0.08, 0.12, 0.98), 6)
+        local pc = UIK.UI.panel   -- panel fill, so it reads as a gap like before
+        dl:AddLine({ x, y }, { x + w, y }, u32(pc[1], pc[2], pc[3], 1.0), 6)
         imgui.Dummy({ 0, 6 })
     end
     local zcMobs = (POS[Canon(zoneTabZone)] or {}).mobs or {}
@@ -2223,7 +3298,7 @@ local function RenderZoneTab()
     imgui.BeginChild('##bm_zone_mobtable', { 0, 0 })
     imgui.Columns(2, '##bm_zone_mobs', false)
     imgui.SetColumnWidth(0, 225)   -- room for "[NM]" tag (and possible "(no map)")
-    imgui.PushStyleColor(ImGuiCol_Text, { 0.60, 0.63, 0.78, 1.0 })
+    imgui.PushStyleColor(ImGuiCol_Text, UIK.UI.label)
     imgui.Text('Monster'); imgui.NextColumn()
     imgui.Text('Level');   imgui.NextColumn()
     imgui.PopStyleColor(1)
@@ -2242,63 +3317,763 @@ local function RenderZoneTab()
     imgui.Columns(1)
     imgui.EndChild()
     imgui.PopStyleColor(1)
-    imgui.EndChild()
+    UIK.frame_end()
 end
 
 -- =========================
--- Settings tab (in-window config UI). Ported from the old Codex config
--- tab; the cross-module "Copy to all" and dispatcher kill-switch were
--- dropped since this is a standalone, single-window addon.
+-- Traits tab: every Blue Magic job-trait set (data/bluemage_traits.lua), the
+-- combinations that unlock each tier, and a set-up designer that totals your
+-- set points and shows which traits / tiers a selection gives.
+-- =========================
+-- Built inside its own function so its helpers don't count toward the main
+-- chunk's 200-local limit.
+local RenderTraitsTab = (function()
+local ok_tr, TRD = pcall(require, 'data/bluemage_traits')
+if not ok_tr or type(TRD) ~= 'table' or type(TRD.TRAITS) ~= 'table' then TRD = { TRAITS = {} } end
+
+local ERA_CAP = 75
+
+-- Resolve each sheet spell to its database record (name or alias) once.
+local TRAITS = {}
+do
+    local byname = {}
+    for _, r in ipairs(DB.SPELLS) do
+        byname[DB.keyify(r.name)] = r
+        if r.aliases then for _, a in ipairs(r.aliases) do byname[DB.keyify(a)] = r end end
+    end
+    for _, t in ipairs(TRD.TRAITS) do
+        local tt = { name = t.name, rule = t.rule, note = t.note, need = t.need or 8, max = t.max, spells = {} }
+        for _, s in ipairs(t.spells or {}) do
+            local rec = byname[DB.keyify(s[2])]
+            tt.spells[#tt.spells + 1] = {
+                lvl = s[1], name = rec and rec.name or s[2], cost = s[3], pts = s[4],
+                rec = rec, id = DB.keyify(s[2]),
+            }
+        end
+        TRAITS[#TRAITS + 1] = tt
+    end
+end
+
+local trait_open     = {}   -- trait name -> expanded?
+local trait_all_open = {}   -- trait name -> "all combinations" list expanded?
+local trait_cache    = {}   -- trait name -> { sig, result }
+
+local ROMAN = { 'I', 'II', 'III', 'IV', 'V', 'VI', 'VII', 'VIII', 'IX', 'X' }
+local function Roman(n) return ROMAN[n] or tostring(n) end
+
+local function TierOf(t, pts)
+    local tier = math.floor(pts / t.need)
+    if t.max and tier > t.max then tier = t.max end
+    return tier
+end
+
+local function TraitSpellKnown(s)
+    return (s.rec and learned and learned[s.rec.key]) and true or false
+end
+
+-- "Only spells at/below my level" removes a spell from the Traits tab
+-- entirely when it's above your BLU level or you haven't learned it.
+local function TraitSpellHidden(s, myLvl)
+    if not cfg.bluemage_trait_only_level then return false end
+    if myLvl and s.lvl > myLvl then return true end
+    return not TraitSpellKnown(s)
+end
+
+-- Why a spell can't be used in combos/designer right now (nil = usable).
+local function TraitSpellBlock(s, myLvl)
+    if s.lvl > ERA_CAP then return ('Lv%d - above the level %d cap'):format(s.lvl, ERA_CAP) end
+    if cfg.bluemage_trait_only_level and myLvl and s.lvl > myLvl then
+        return ('Lv%d - above your BLU level'):format(s.lvl)
+    end
+    if (cfg.bluemage_trait_only_learned or cfg.bluemage_trait_only_level) and not TraitSpellKnown(s) then
+        return 'not learned yet'
+    end
+    return nil
+end
+
+local function ComboText(list)
+    local names = {}
+    for _, s in ipairs(list) do names[#names + 1] = s.name end
+    return table.concat(names, ' + ')
+end
+
+-- Enumerate every subset of the usable spells (sets are small: <= 12 spells).
+--   cheapest[k] = cheapest spell set reaching tier k
+--   minimal     = every tier-I combination with no spare spell, cheapest first
+local function TraitCombos(t, myLvl, learnedCount)
+    local sig = ('%s|%s|%s|%s'):format(tostring(cfg.bluemage_trait_only_level),
+        tostring(cfg.bluemage_trait_only_learned), tostring(myLvl), tostring(learnedCount))
+    local c = trait_cache[t.name]
+    if c and c.sig == sig then return c.res end
+
+    local pool = {}
+    for _, s in ipairs(t.spells) do
+        if not TraitSpellBlock(s, myLvl) then pool[#pool + 1] = s end
+    end
+    local n = #pool
+    local cheapest, minimal = {}, {}
+    local function better(a, b)          -- a cheaper than b?
+        if not b then return true end
+        if a.cost ~= b.cost then return a.cost < b.cost end
+        if #a.list ~= #b.list then return #a.list < #b.list end
+        return a.lvl < b.lvl
+    end
+    for mask = 1, (2 ^ n) - 1 do
+        local list, cost, pts, top = {}, 0, 0, 0
+        for i = 1, n do
+            if math.floor(mask / 2 ^ (i - 1)) % 2 == 1 then
+                local s = pool[i]
+                list[#list + 1] = s
+                cost = cost + s.cost; pts = pts + s.pts
+                if s.lvl > top then top = s.lvl end
+            end
+        end
+        local tier = TierOf(t, pts)
+        if tier >= 1 then
+            local cand = { list = list, cost = cost, pts = pts, lvl = top }
+            for k = 1, tier do
+                if better(cand, cheapest[k]) then cheapest[k] = cand end
+            end
+            -- Minimal for tier I: dropping any one spell loses the trait.
+            local spare = false
+            for _, s in ipairs(list) do
+                if TierOf(t, pts - s.pts) >= 1 then spare = true; break end
+            end
+            if not spare then minimal[#minimal + 1] = cand end
+        end
+    end
+    table.sort(minimal, better)
+    -- Spells that take part in at least one valid combo (any tier-I
+    -- combination with no spare spell, or a cheapest set for any tier).
+    local used = {}
+    for _, cmb in ipairs(minimal) do for _, s in ipairs(cmb.list) do used[s.id] = true end end
+    for _, cmb in pairs(cheapest) do for _, s in ipairs(cmb.list) do used[s.id] = true end end
+    local res = { cheapest = cheapest, minimal = minimal, pool = n, used = used }
+    trait_cache[t.name] = { sig = sig, res = res }
+    return res
+end
+
+-- Designer selection helpers (persisted in cfg.bluemage_trait_design).
+local function Design()
+    if not cfg.bluemage_trait_design then cfg.bluemage_trait_design = T{} end
+    return cfg.bluemage_trait_design
+end
+
+-- Replace this trait's selected spells with the given combination.
+local function UseCombo(t, list)
+    local d = Design()
+    for _, s in ipairs(t.spells) do d[s.id] = nil end
+    for _, s in ipairs(list) do d[s.id] = true end
+    settings.save()
+end
+
+-- Totals for the current design.
+local function DesignTotals()
+    local d = Design()
+    local used, count = 0, 0
+    local per = {}                        -- trait name -> points
+    local chosen = {}                     -- { trait, spell }
+    for _, t in ipairs(TRAITS) do
+        local pts = 0
+        for _, s in ipairs(t.spells) do
+            if d[s.id] then
+                used = used + s.cost; count = count + 1; pts = pts + s.pts
+                chosen[#chosen + 1] = { t = t, s = s }
+            end
+        end
+        per[t.name] = pts
+    end
+    return used, count, per, chosen
+end
+
+local COL_DIM    = { 0.55, 0.58, 0.72, 1.0 }
+local COL_HEAD   = { 0.80, 0.90, 1.00, 1.0 }
+local COL_TEXT   = { 0.82, 0.85, 0.94, 1.0 }
+local COL_GOOD   = { 0.55, 0.88, 0.55, 1.0 }
+local COL_WARN   = { 0.95, 0.70, 0.35, 1.0 }
+local COL_BAD    = { 0.95, 0.45, 0.40, 1.0 }
+local COL_GREY   = { 0.42, 0.44, 0.52, 1.0 }
+local COL_TIER   = { 0.55, 0.85, 1.00, 1.0 }
+
+local COL_COLHEAD = { 0.60, 0.63, 0.78, 1.0 }
+local COL_SUBHEAD = { 0.75, 0.78, 0.90, 1.0 }
+
+local function TextC(col, s)
+    imgui.PushStyleColor(ImGuiCol_Text, col); imgui.Text(s); imgui.PopStyleColor(1)
+end
+
+-- One trait's expanded body: rule text, spell table, cheapest/all combos.
+local function RenderTraitBody(t, visible, myLvl, learnedCount)
+    local K, d = UIK, Design()
+    imgui.Indent(12)
+    if t.rule and t.rule ~= '' then K.note(t.rule) end
+    if t.note then TextC(COL_WARN, t.note) end
+
+    -- Spell table: Set | Lv | Spell | Cost | Pts, sized to the panel.
+    local tw = math.max(160, K.inner_width() - 12)
+    if imgui.BeginTable('##trtcols_' .. t.name, 5, ImGuiTableFlags_SizingFixedFit or 0, { tw, 0 }) then
+        imgui.TableSetupColumn('set',   ImGuiTableColumnFlags_WidthFixed or 0, 30)
+        imgui.TableSetupColumn('lv',    ImGuiTableColumnFlags_WidthFixed or 0, 30)
+        imgui.TableSetupColumn('spell', ImGuiTableColumnFlags_WidthStretch or 0)
+        imgui.TableSetupColumn('cost',  ImGuiTableColumnFlags_WidthFixed or 0, 36)
+        imgui.TableSetupColumn('pts',   ImGuiTableColumnFlags_WidthFixed or 0, 30)
+        imgui.TableNextRow()
+        for i, h in ipairs({ 'Set', 'Lv', 'Spell', 'Cost', 'Pts' }) do
+            imgui.TableSetColumnIndex(i - 1); TextC(COL_COLHEAD, h)
+        end
+        for _, s in ipairs(visible) do
+            local block = TraitSpellBlock(s, myLvl)
+            imgui.TableNextRow()
+            imgui.TableSetColumnIndex(0)
+            if s.lvl > ERA_CAP then
+                TextC(COL_GREY, ' -')
+            else
+                local v = { d[s.id] and true or false }
+                if imgui.Checkbox('##trtset_' .. s.id, v) then
+                    d[s.id] = v[1] or nil; settings.save()
+                end
+            end
+            imgui.TableSetColumnIndex(1)
+            imgui.AlignTextToFramePadding()
+            TextC(block and COL_GREY or COL_TEXT, tostring(s.lvl))
+            imgui.TableSetColumnIndex(2)
+            imgui.AlignTextToFramePadding()
+            local isL = s.rec and learned and learned[s.rec.key]
+            local col = block and COL_GREY or (isL and COL_GOOD or COL_TEXT)
+            TextC(col, s.name .. (isL and '  [X]' or ''))
+            if imgui.IsItemHovered() then
+                local tip = block or (isL and 'Learned' or 'Not learned yet')
+                if not s.rec then tip = tip .. '\n(not in the Horizon spell list)' end
+                imgui.SetTooltip(tip)
+            end
+            imgui.TableSetColumnIndex(3)
+            imgui.AlignTextToFramePadding()
+            TextC(block and COL_GREY or COL_TEXT, tostring(s.cost))
+            imgui.TableSetColumnIndex(4)
+            imgui.AlignTextToFramePadding()
+            TextC(block and COL_GREY or COL_TEXT, tostring(s.pts))
+        end
+        imgui.EndTable()
+    end
+
+    -- Cheapest way to reach each tier.
+    local res = TraitCombos(t, myLvl, learnedCount)
+    if #res.cheapest == 0 then
+        TextC(COL_WARN, 'No usable combination with the current filters.')
+    else
+        TextC(COL_SUBHEAD, 'Cheapest per tier  (click to use in your set-up):')
+        for k, cmb in ipairs(res.cheapest) do
+            local tl = (t.max == 1) and '' or ('Tier %-4s '):format(Roman(k))
+            local line = ('  %scost %2d   %s'):format(tl, cmb.cost, ComboText(cmb.list))
+            imgui.PushStyleColor(ImGuiCol_Text, COL_TIER)
+            if imgui.Selectable(line .. '##trtch_' .. t.name .. k, false) then UseCombo(t, cmb.list) end
+            imgui.PopStyleColor(1)
+        end
+
+        -- Every tier-I combination.
+        local aopen = trait_all_open[t.name] and true or false
+        local alabel = ('%s All %s combinations (%d)'):format(aopen and '[-]' or '[+]',
+            (t.max == 1) and 'valid' or 'tier I', #res.minimal)
+        imgui.PushStyleColor(ImGuiCol_Text, COL_DIM)
+        if imgui.Selectable(alabel .. '##trtall_' .. t.name, aopen) then trait_all_open[t.name] = not aopen end
+        imgui.PopStyleColor(1)
+        if aopen then
+            for i, cmb in ipairs(res.minimal) do
+                local line = ('     cost %2d   %s%s'):format(cmb.cost, ComboText(cmb.list),
+                    (t.need ~= 8 or cmb.pts ~= 8) and ('   (%d trait pts)'):format(cmb.pts) or '')
+                imgui.PushStyleColor(ImGuiCol_Text, COL_TEXT)
+                if imgui.Selectable(line .. '##trtmin_' .. t.name .. i, false) then UseCombo(t, cmb.list) end
+                imgui.PopStyleColor(1)
+            end
+        end
+    end
+    imgui.Unindent(12)
+end
+
+local function RenderTraitReference(myLvl, learnedCount, per, pw)
+    local K = UIK
+    K.section_begin('trt_ref', 'Trait Sets', pw)
+    local shown = 0
+    if K.block_begin('##trt_ref_block') then
+        for _, t in ipairs(TRAITS) do
+            -- Spells left after the filters; skip the whole category when
+            -- none of its spells survive.
+            local combo = cfg.bluemage_trait_can_combo and TraitCombos(t, myLvl, learnedCount) or nil
+            local visible = {}
+            for _, s in ipairs(t.spells) do
+                if not TraitSpellHidden(s, myLvl) and (not combo or combo.used[s.id]) then
+                    visible[#visible + 1] = s
+                end
+            end
+            if #visible > 0 then
+                shown = shown + 1
+                local open = trait_open[t.name] and true or false
+                local tier = TierOf(t, per[t.name] or 0)
+                local label = (open and '[-] ' or '[+] ') .. t.name
+                imgui.PushStyleColor(ImGuiCol_Text, COL_HEAD)
+                if imgui.Selectable(label .. '##trt_' .. t.name, open) then trait_open[t.name] = not open end
+                imgui.PopStyleColor(1)
+                if tier > 0 then
+                    -- "- Lv N" right after the trait name, drawn on the row so the
+                    -- header's click area and layout stay the same.
+                    -- The Selectable's rect is padded above/below the text by half
+                    -- the item spacing, so center the text in it vertically.
+                    pcall(function()
+                        local ax, ay = vec2(imgui.GetItemRectMin())
+                        local _,  by = vec2(imgui.GetItemRectMax())
+                        local w = imgui.CalcTextSize(label)
+                        if type(w) ~= 'number' then w = #label * 7 end
+                        local lh = imgui.GetTextLineHeight() or 13
+                        local ty = ay + math.floor(((by - ay) - lh) * 0.5 + 0.5)
+                        imgui.GetWindowDrawList():AddText({ ax + w + 6, ty },
+                            u32(COL_GOOD[1], COL_GOOD[2], COL_GOOD[3], 1.0), ('- Lv %d'):format(tier))
+                    end)
+                end
+                if open then
+                    RenderTraitBody(t, visible, myLvl, learnedCount)
+                    imgui.Separator()
+                end
+            end
+        end
+        if shown == 0 then
+            TextC(COL_DIM, cfg.bluemage_trait_can_combo
+                and 'No trait can be made with the current filters yet.'
+                or  'No known trait spells at or below your level yet.')
+        end
+        K.block_end()
+    end
+    K.section_end()
+end
+
+-- ---------- Max Blue Magic set points ----------
+-- Your BLU level (main job, else support job) and which one it is.
+local function BlueJobLevel()
+    local mm = AshitaCore and AshitaCore:GetMemoryManager()
+    local party = mm and mm:GetParty()
+    if not party then return nil end
+    local ok, mj, ml, sj, sl = pcall(function()
+        return party:GetMemberMainJob(0), party:GetMemberMainJobLevel(0),
+               party:GetMemberSubJob(0), party:GetMemberSubJobLevel(0)
+    end)
+    if not ok then return nil end
+    if mj == BLU_JOB_ID and type(ml) == 'number' and ml > 0 then return ml, 'main' end
+    if sj == BLU_JOB_ID and type(sl) == 'number' and sl > 0 then return sl, 'sub' end
+    return nil
+end
+
+-- Server rule (LSB blueutils): 10 points, +5 at levels 11, 21, 31 ... 71
+-- (45 at 71-75). HorizonXI has no Assimilation merits; instead BLU gets a
+-- built-in Assimilation: +5 once 90 or more spells are learned (main job).
+local ASSIM_SPELLS = 90
+local ASSIM_BONUS  = 5
+local function AssimBonus()
+    return (CountLearned() >= ASSIM_SPELLS) and ASSIM_BONUS or 0
+end
+-- Highest value the manual slider allows: 45, or 50 with 90+ spells.
+local function ManualMaxPoints()
+    return 45 + AssimBonus()
+end
+local function BluePointsForLevel(lvl)
+    return math.floor((lvl - 1) / 10) * 5 + 10
+end
+
+-- Returns max points, and a short explanation for the UI.
+local function MaxBluePoints()
+    if cfg.bluemage_trait_manual then
+        local cap = ManualMaxPoints()
+        return math.min(cfg.bluemage_trait_points or 45, cap), 'set manually'
+    end
+    local lvl, which = BlueJobLevel()
+    if lvl then
+        if cfg.bluemage_trait_last_level ~= lvl then
+            cfg.bluemage_trait_last_level = lvl; settings.save()
+        end
+    else
+        lvl, which = cfg.bluemage_trait_last_level or 75, 'last'
+    end
+    local base  = BluePointsForLevel(lvl)
+    local bonus = (which ~= 'sub') and AssimBonus() or 0   -- main job only
+    local src = (which == 'main' and ('Lv%d BLU'):format(lvl))
+             or (which == 'sub'  and ('Lv%d BLU (support job)'):format(lvl))
+             or ('Lv%d BLU (last seen - not on BLU now)'):format(lvl)
+    local expl = src .. ((bonus > 0) and (': %d + %d for 90+ spells'):format(base, bonus) or '')
+    return base + bonus, expl, lvl, which
+end
+
+local function RenderTraitDesigner(myLvl, used, count, per, chosen, pw)
+    local K, UI = UIK, UIK.UI
+    local budget = MaxBluePoints()
+    local other  = cfg.bluemage_trait_other or 0
+    local total  = used + other
+    local left   = budget - total
+
+    -- ---- Points ----
+    K.section_begin('trt_setup', 'Your Set-up', pw)
+    TextC(total > budget and COL_BAD or COL_GOOD, ('Set points: %d / %d'):format(total, budget))
+    K.note(('%d left'):format(math.max(0, left)))
+    if other > 0 then K.note(('%d from trait spells + %d reserved'):format(used, other)) end
+    if total > budget then TextC(COL_BAD, ('Over by %d point%s'):format(-left, -left == 1 and '' or 's')) end
+    K.section_end()
+
+    -- ---- Traits gained ----
+    K.section_begin('trt_gained', 'Traits Gained', pw)
+    local any = false
+    for _, t in ipairs(TRAITS) do
+        local pts = per[t.name] or 0
+        if pts > 0 then
+            any = true
+            local tier = TierOf(t, pts)
+            local capped = t.max and tier >= t.max
+            local to_next = capped and 0 or (t.need * (tier + 1) - pts)
+            if tier > 0 then
+                local txt = t.name .. ((t.max == 1) and '' or (' ' .. Roman(tier)))
+                if not capped and to_next < t.need then
+                    txt = txt .. ('  (+%d to %s)'):format(to_next, Roman(tier + 1))
+                elseif capped and t.max and t.max > 1 then
+                    txt = txt .. '  (max)'
+                end
+                TextC(COL_GOOD, txt)
+            else
+                TextC(COL_WARN, ('%s: %d/%d pts (need +%d)'):format(t.name, pts, t.need, to_next))
+            end
+        end
+    end
+    if not any then K.note('None yet - tick spells on the left.') end
+    K.section_end()
+
+    -- ---- Spells set ----
+    K.section_begin('trt_chosen', ('Spells Set (%d)'):format(count), pw)
+    if count == 0 then
+        K.note('Tick spells, or click a combination, to build a set-up.')
+    elseif K.block_begin('##trt_chosen_block') then
+        for i, c in ipairs(chosen) do
+            local s = c.s
+            local warn = nil
+            if myLvl and s.lvl > myLvl then warn = 'above your level'
+            elseif not (s.rec and learned and learned[s.rec.key]) then warn = 'not learned' end
+            imgui.PushStyleColor(ImGuiCol_Text, warn and COL_WARN or COL_TEXT)
+            if imgui.Selectable(('%2d  %s%s##trtdes_%d'):format(s.cost, s.name, warn and ('  (' .. warn .. ')') or '', i), false) then
+                Design()[s.id] = nil; settings.save()
+            end
+            imgui.PopStyleColor(1)
+            if imgui.IsItemHovered() then
+                imgui.SetTooltip(c.t.name .. ('  -  %d trait pts\nClick to remove.'):format(s.pts))
+            end
+        end
+        K.block_end()
+        if K.button('Clear set-up##trt') then
+            local d = Design()
+            for k in pairs(d) do d[k] = nil end
+            settings.save()
+        end
+    end
+    K.section_end()
+end
+
+local function RenderTraitsTab()
+    local K, UI = UIK, UIK.UI
+    local myLvl = GetBluLevel()
+    local learnedCount = CountLearned()
+    local maxpts, expl, plvl, pwhich = MaxBluePoints()
+
+    -- Controls panel on top; the two panes below scroll on their own.
+    imgui.PushStyleColor(ImGuiCol_ChildBg, { 0, 0, 0, 0 })
+    local pw = K.panel_width()
+
+    -- ---- Controls ----
+    K.section_begin('trt_controls', 'Blue Points & Filters', pw)
+    if K.rows_begin('##trt_rows_controls') then
+        K.row('Blue points', 'Worked out from your BLU level: 10, +5 at Lv11/21/31/41/51/61/71 = 45 at 75. HorizonXI adds +5 (built-in Assimilation) once you know 90 or more spells. Tick Set manually to pick your own value.')
+        K.text(UI.value, tostring(maxpts))
+        imgui.SameLine(0, 8); K.text(UI.dim, '(' .. expl .. ')')
+        imgui.SameLine(0, 14)
+        K.check('Set manually##trt', cfg.bluemage_trait_manual, function(v)
+            cfg.bluemage_trait_manual = v
+            if v then cfg.bluemage_trait_points = math.min(maxpts, ManualMaxPoints()) end   -- start from the auto value
+        end, 'On: type your own maximum instead of using your BLU level.')
+
+        local nLearned = learnedCount or CountLearned()
+        if cfg.bluemage_trait_manual then
+            local cap = ManualMaxPoints()
+            if (cfg.bluemage_trait_points or 45) > cap then cfg.bluemage_trait_points = cap end
+            K.row('Max points', 'Your maximum Blue Magic set points. Up to 45, or 50 once you know 90 or more spells (HorizonXI built-in Assimilation). Ctrl+click the slider to type a value.')
+            K.slider('int', '##trt_maxpts', cfg.bluemage_trait_points or 45, 0, cap, '%d', nil,
+                function(v) cfg.bluemage_trait_points = math.max(0, math.min(cap, v)) end)
+            K.side(('max %d'):format(cap))
+        end
+        K.row('Assimilation', 'HorizonXI built-in Assimilation: +5 blue points once you have learned 90 or more Blue Magic spells (main job). Replaces the retail merits.')
+        if nLearned >= ASSIM_SPELLS then
+            K.text({ 0.55, 0.88, 0.55, 1.0 }, ('+%d  (%d spells learned)'):format(ASSIM_BONUS, nLearned))
+        else
+            K.text(UI.dim, ('+0  (%d / %d spells learned)'):format(nLearned, ASSIM_SPELLS))
+        end
+
+        K.row('Reserved', 'Points set aside for spells you\'ll set anyway (nukes, cures, etc. that aren\'t part of a trait).')
+        K.slider('int', '##trt_reserved', cfg.bluemage_trait_other or 0, 0, 80, '%d pts', 0,
+            function(v) cfg.bluemage_trait_other = v end)
+
+        K.row('Filters', 'Narrow the Trait Sets list. Hover each box for details.')
+        K.check('Only learned##trt', cfg.bluemage_trait_only_learned, function(v)
+            cfg.bluemage_trait_only_learned = v
+        end, 'Greys out spells you haven\'t learned and leaves them out of the combinations.')
+        imgui.SameLine(0, 14)
+        K.check('At/below my level##trt', cfg.bluemage_trait_only_level, function(v)
+            cfg.bluemage_trait_only_level = v
+        end, 'Hides spells you haven\'t learned and spells above your level, and hides traits with no known spells. '
+            .. (myLvl and ('Your BLU level: %d.'):format(myLvl) or 'Not on BLU - only the learned part applies.'))
+        imgui.SameLine(0, 14)
+        K.check('Can Combo##trt', cfg.bluemage_trait_can_combo, function(v)
+            cfg.bluemage_trait_can_combo = v
+        end, 'Only show traits you can actually unlock with the spells allowed by the other filters, and only the spells that are part of a valid combination.')
+        imgui.EndTable()
+    end
+    K.section_end()
+
+    local used, count, per, chosen = DesignTotals()
+
+    -- ---- Two panes: reference (left) | designer (right) ----
+    local aw, ah = 600, 400
+    pcall(function()
+        local w, h = imgui.GetContentRegionAvail()
+        if type(w) == 'number' then aw = w end
+        if type(h) == 'number' then ah = h end
+    end)
+    local dw = 280
+    local lw = math.max(200, aw - dw - 8)
+
+    imgui.BeginChild('##bm_traits_ref', { lw, ah })
+    RenderTraitReference(myLvl, learnedCount, per, K.panel_width())
+    imgui.Dummy({ 0, 4 })
+    imgui.EndChild()
+    imgui.SameLine(0, 8)
+    imgui.BeginChild('##bm_traits_design', { 0, ah })
+    RenderTraitDesigner(myLvl, used, count, per, chosen, K.panel_width())
+    imgui.Dummy({ 0, 4 })
+    imgui.EndChild()
+    imgui.PopStyleColor(1)   -- ChildBg
+end
+
+return RenderTraitsTab
+end)()
+
+-- =========================
+-- Counter tab: every Blue Magic ability you've seen monsters use, listed by
+-- ability; hover a row for its per-monster breakdown. Counting happens while
+-- BLU is your main job.
+-- =========================
+-- Built inside its own function so its helpers don't count toward the main
+-- chunk's 200-local limit.
+local RenderCounterTab = (function()
+local cnt_sort    = 'count'     -- 'count' | 'name'
+local cnt_search  = { '' }
+
+local C_TEXT  = { 0.82, 0.85, 0.94, 1.0 }
+local C_NUM   = { 0.55, 0.85, 1.00, 1.0 }
+local C_GOOD  = { 0.55, 0.88, 0.55, 1.0 }
+local C_DIM   = { 0.55, 0.58, 0.72, 1.0 }
+local C_MUTED = { 0.45, 0.48, 0.60, 1.0 }
+local C_COL   = { 0.60, 0.63, 0.78, 1.0 }
+local SEEN_COL_W = 56   -- width of the Seen column
+local NAME_GAP   = 18   -- room between the longest name and the Seen column
+
+local function TextC(col, s)
+    imgui.PushStyleColor(ImGuiCol_Text, col); imgui.Text(s); imgui.PopStyleColor(1)
+end
+
+-- Two-state toggle drawn as a pair of buttons; the active one is lit.
+local function Seg(id, cur, options)
+    local UI = UIK.UI
+    local out = cur
+    for i, o in ipairs(options) do
+        if i > 1 then imgui.SameLine(0, 4) end
+        local on = (cur == o[1])
+        imgui.PushStyleColor(ImGuiCol_Button,        on and { 0.32, 0.38, 0.58, 1.0 } or UI.btn)
+        imgui.PushStyleColor(ImGuiCol_ButtonHovered, on and { 0.38, 0.45, 0.68, 1.0 } or UI.btn_hov)
+        imgui.PushStyleColor(ImGuiCol_Text,          on and { 0.88, 0.92, 1.00, 1.0 } or C_DIM)
+        if imgui.Button(o[2] .. '##' .. id .. o[1]) then out = o[1] end
+        imgui.PopStyleColor(3)
+    end
+    return out
+end
+
+local function Matches(needle, ...)
+    if needle == '' then return true end
+    for _, s in ipairs({ ... }) do
+        if type(s) == 'string' and s:lower():find(needle, 1, true) then return true end
+    end
+    return false
+end
+
+local function SortRows(rows)
+    table.sort(rows, function(a, b)
+        if cnt_sort == 'count' and a.n ~= b.n then return a.n > b.n end
+        return a.name < b.name
+    end)
+end
+
+-- Rows for the "by ability" view. Counts come only from SeenBy, which is
+-- filled only from action packets read while BLU was your main job.
+local function AbilityRows(needle, hideLearned, showUnseen)
+    local rows = {}
+    for _, r in ipairs(DB.SPELLS) do
+        local mobs, n = {}, 0
+        for mob, c in pairs(SeenBy.data[r.key] or {}) do
+            mobs[#mobs + 1] = { name = mob, n = c }; n = n + c
+        end
+        local isL = learned and learned[r.key]
+        if (n > 0 or showUnseen) and not (hideLearned and isL) then
+            local mobHit = false
+            for _, m in ipairs(mobs) do if Matches(needle, m.name) then mobHit = true; break end end
+            if mobHit or Matches(needle, r.name, r.fam) then
+                SortRows(mobs)
+                rows[#rows + 1] = { name = r.name, n = n, learned = isL, sub = mobs }
+            end
+        end
+    end
+    SortRows(rows)
+    return rows
+end
+
+local function Totals()
+    local sightings, abilities, mobs, nm = 0, 0, {}, 0
+    for _, t in pairs(SeenBy.data) do
+        local any = false
+        for mob, c in pairs(t) do
+            if c > 0 then
+                sightings = sightings + c; any = true
+                if not mobs[mob] then mobs[mob] = true; nm = nm + 1 end
+            end
+        end
+        if any then abilities = abilities + 1 end
+    end
+    return sightings, abilities, nm
+end
+
+-- Hover list of the breakdown (monsters for an ability, abilities for a monster).
+local function BreakdownTip(title, sub)
+    if not imgui.IsItemHovered() or #sub == 0 then return end
+    local lines = { title }
+    for _, s in ipairs(sub) do lines[#lines + 1] = ('  %s  x%d'):format(s.name, s.n) end
+    imgui.SetTooltip(table.concat(lines, '\n'))
+end
+
+-- Two-column list: name, then the count right beside it. The name column is
+-- only as wide as the longest name (plus a small gap).
+local function DrawList(id, header, rows, tipTitle)
+    local nw = imgui.CalcTextSize(header)
+    for _, row in ipairs(rows) do
+        local label = row.name .. (row.learned and '  [X]' or '')
+        row.label = label
+        nw = math.max(nw, (imgui.CalcTextSize(label)))
+    end
+    nw = nw + NAME_GAP
+    local tw = math.min(UIK.inner_width(), nw + SEEN_COL_W + 8)
+    if not imgui.BeginTable(id, 2, ImGuiTableFlags_SizingFixedFit or 0, { tw, 0 }) then return end
+    imgui.TableSetupColumn('name', ImGuiTableColumnFlags_WidthFixed or 0, nw)
+    imgui.TableSetupColumn('n',    ImGuiTableColumnFlags_WidthFixed or 0, SEEN_COL_W)
+    imgui.TableNextRow()
+    imgui.TableSetColumnIndex(0); TextC(C_COL, header)
+    imgui.TableSetColumnIndex(1); TextC(C_COL, 'Seen')
+    for _, row in ipairs(rows) do
+        imgui.TableNextRow()
+        imgui.TableSetColumnIndex(0)
+        TextC(row.learned and C_GOOD or (row.n > 0 and C_TEXT or C_MUTED), row.label)
+        BreakdownTip(tipTitle, row.sub)
+        imgui.TableSetColumnIndex(1)
+        TextC(row.n > 0 and C_NUM or C_MUTED, 'x' .. tostring(row.n))
+    end
+    imgui.EndTable()
+end
+
+return function()
+    local K, UI = UIK, UIK.UI
+    imgui.PushStyleColor(ImGuiCol_ChildBg, { 0, 0, 0, 0 })
+    local pw = K.panel_width()
+
+    -- ---- Summary & options ----
+    local sightings, abilities, nmobs = Totals()
+    K.section_begin('cnt_opts', 'Seen Counter', pw)
+    if K.rows_begin('##cnt_rows_opts') then
+        K.row('Totals', 'Each time a monster claimed by you or your party/alliance finishes a Blue Magic ability, read from the action packet while BLU is your main job. A spell stops counting once learned.')
+        K.text(UI.value, tostring(sightings))
+        imgui.SameLine(0, 6)
+        K.text(UI.dim, ('sightings  -  %d abilit%s  -  %d monster%s'):format(
+            abilities, abilities == 1 and 'y' or 'ies', nmobs, nmobs == 1 and '' or 's'))
+
+        K.row('Sort', 'Order the list by sightings (highest first) or by name. Hover a row to see which monsters it was seen from.')
+        cnt_sort = Seg('cnt_sort', cnt_sort, { { 'count', 'Count' }, { 'name', 'Name' } })
+
+        K.row('Search', 'Matches ability names, monster names, and learn-from families.')
+        imgui.SetNextItemWidth(K.SLIDER_W + 40)
+        imgui.InputText('##cnt_search', cnt_search, 64)
+
+        K.row('Show', 'Filters for the list below.')
+        K.check('Hide learned##cnt', cfg.bluemage_counter_hide_learned, function(v)
+            cfg.bluemage_counter_hide_learned = v
+        end, 'Leave out spells you have already learned.')
+        imgui.SameLine(0, 14)
+        K.check('Include unseen##cnt', cfg.bluemage_counter_show_unseen, function(v)
+            cfg.bluemage_counter_show_unseen = v
+        end, 'Also list abilities with no sightings yet (x0).')
+        imgui.EndTable()
+    end
+    K.section_end()
+
+    -- ---- List (scrolls on its own) ----
+    local needle = (cnt_search[1] or ''):lower()
+    imgui.BeginChild('##cnt_list_scroll', { 0, 0 })
+    local lw = K.panel_width()
+    local rows = AbilityRows(needle, cfg.bluemage_counter_hide_learned, cfg.bluemage_counter_show_unseen)
+    K.section_begin('cnt_list', ('Abilities (%d)'):format(#rows), lw)
+    if #rows == 0 then
+        K.note(sightings == 0
+            and 'Nothing seen yet. Fight monsters that use Blue Magic abilities while on BLU and they\'ll show up here.'
+            or  'Nothing matches the current filters.')
+    else
+        DrawList('##cnt_abil', 'Ability', rows, 'Seen from:')
+    end
+    K.section_end()
+    imgui.Dummy({ 0, 4 })
+    imgui.EndChild()
+    imgui.PopStyleColor(1)   -- ChildBg
+end
+end)()
+
+
+-- =========================
+-- Settings tab (in-window config UI), laid out like Codex's config tabs:
+-- titled panels with label/control rows (see the UI kit near the top).
 -- =========================
 local function RenderConfigTab()
-    -- Dark body background matching the main window.
-    imgui.PushStyleColor(ImGuiCol_ChildBg, {
-        cfg.bluemage_bg_color_r or 0.06, cfg.bluemage_bg_color_g or 0.07,
-        cfg.bluemage_bg_color_b or 0.10, cfg.bluemage_bg_color_a or 0.96 })
+    local K, UI = UIK, UIK.UI
+    local function dis_begin(off) if off and imgui.BeginDisabled then imgui.BeginDisabled() end end
+    local function dis_end(off)   if off and imgui.EndDisabled   then imgui.EndDisabled()   end end
+
+    -- Scrollable pane; the window background shows through behind the panels.
+    imgui.PushStyleColor(ImGuiCol_ChildBg, { 0, 0, 0, 0 })
     imgui.BeginChild('##blu_settings_body', { 0, 0 })
+    local pw = K.panel_width()
 
-    -- ================= Action Learned text window (BlueLearn) =================
-    imgui.PushStyleColor(ImGuiCol_Text, { 0.75, 0.78, 0.90, 1.0 })
-    imgui.Text('Action Learned Text Window:')
-    imgui.PopStyleColor(1)
+    -- ================= Window =================
+    K.section_begin('blu_window', 'Window', pw)
+    if K.rows_begin('##blu_rows_window') then
+        K.row('Open the window', 'Toggles this window. The gear on the Blue Magic Tracker mini window also opens/closes it, on the tab you used last.')
+        K.text(UI.dim, '/blutracker')
+        imgui.SameLine(0, 6); K.text(UI.dim, 'or'); imgui.SameLine(0, 6)
+        K.text(UI.dim, '/blut')
 
-    local bl_en = { cfg.bluelearn_enabled ~= false }
-    if imgui.Checkbox('Enabled##bluelearn', bl_en) then
-        cfg.bluelearn_enabled = bl_en[1]; settings.save()
+        K.row('Lock its position', 'Stops the main window and the tracker window being dragged or resized by accident.')
+        K.check('##blu_lock', cfg.bluemage_lock_ui, function(v)
+            cfg.bluemage_lock_ui = v
+            if vt and vt.cfg_bluemage_lock_ui then vt.cfg_bluemage_lock_ui[1] = v end
+        end)
+        imgui.EndTable()
     end
-    if imgui.IsItemHovered() then
-        imgui.SetTooltip('Show a centered splash with the spell name\nwhen YOU learn a Blue Magic spell.')
-    end
-    imgui.SameLine(148, 0)
-    local bl_snd = { cfg.bluelearn_play_sound ~= false }
-    if imgui.Checkbox('Play sound##bluelearn', bl_snd) then
-        cfg.bluelearn_play_sound = bl_snd[1]; settings.save()
-    end
-    imgui.SameLine(0, 12)
-    local bl_rules = { cfg.bluelearn_show_rules ~= false }
-    if imgui.Checkbox('Rules##bluelearn', bl_rules) then
-        cfg.bluelearn_show_rules = bl_rules[1]; settings.save()
-    end
-    if imgui.IsItemHovered() then imgui.SetTooltip('Draw the decorative lines above/below the text.') end
+    K.section_end()
 
-    imgui.PushItemWidth(150)
-    local bl_dur = { cfg.bluelearn_duration or 3.5 }
-    if imgui.SliderFloat('Duration (s)##bluelearn', bl_dur, 1.0, 8.0, '%.1f') then
-        cfg.bluelearn_duration = bl_dur[1]; settings.save()
-    end
-    local bl_posy = { cfg.bluelearn_pos_y or 0.28 }
-    if imgui.SliderFloat('Vertical pos##bluelearn', bl_posy, 0.05, 0.90, '%.2f') then
-        cfg.bluelearn_pos_y = bl_posy[1]; settings.save()
-    end
-    if imgui.IsItemHovered() then imgui.SetTooltip('0.00 = top of screen, 0.50 = middle.') end
-    local bl_fh = { math.floor(cfg.bluelearn_font_height or 46) }
-    if imgui.SliderInt('Font size##bluelearn', bl_fh, 20, 80) then
-        cfg.bluelearn_font_height = bl_fh[1]; settings.save()
-    end
-    imgui.PopItemWidth()
-
-    -- Colors (stored as ARGB 0xAARRGGBB; edited as RGBA).
-    local function bl_argb_to_rgba(v)
+    -- ================= Action Learned splash (BlueLearn) =================
+    -- Colors are stored as ARGB 0xAARRGGBB and edited as RGBA.
+    local function argb_to_rgba(v)
         v = v or 0
         local a = math.floor(v / 0x1000000) % 256
         local r = math.floor(v / 0x10000) % 256
@@ -2306,88 +4081,107 @@ local function RenderConfigTab()
         local b = v % 256
         return { r / 255, g / 255, b / 255, a / 255 }
     end
-    local function bl_rgba_to_argb(t)
+    local function rgba_to_argb(t)
         local a = math.floor((t[4] or 1) * 255 + 0.5)
         local r = math.floor((t[1] or 0) * 255 + 0.5)
         local g = math.floor((t[2] or 0) * 255 + 0.5)
         local b = math.floor((t[3] or 0) * 255 + 0.5)
         return a * 0x1000000 + r * 0x10000 + g * 0x100 + b
     end
-    local function bl_color(label, key, has_alpha)
-        imgui.PushStyleColor(ImGuiCol_Text, { 0.70, 0.73, 0.85, 1.0 })
-        imgui.AlignTextToFramePadding(); imgui.Text(label); imgui.PopStyleColor(1)
-        imgui.SameLine(96, 0)
-        local t = bl_argb_to_rgba(cfg[key])
-        imgui.SetNextItemWidth(24)
-        local flags = ImGuiColorEditFlags_NoInputs
-        if has_alpha then flags = bit.bor(flags, ImGuiColorEditFlags_AlphaBar) end
+    local function color_row(label, key, help)
+        K.row(label, help)
+        local t = argb_to_rgba(cfg[key])
+        local flags = bit.bor(ImGuiColorEditFlags_NoInputs, ImGuiColorEditFlags_AlphaBar)
         if imgui.ColorEdit4('##' .. key, t, flags) then
-            cfg[key] = bl_rgba_to_argb(t); settings.save()
+            cfg[key] = rgba_to_argb(t)
+            if not imgui.IsItemDeactivatedAfterEdit then settings.save() end
         end
+        if imgui.IsItemDeactivatedAfterEdit and imgui.IsItemDeactivatedAfterEdit() then settings.save() end
+        if imgui.BeginPopupContextItem('##ctx_' .. key) then
+            if imgui.MenuItem('Reset to Default') and default_cfg then
+                cfg[key] = default_cfg[key]; settings.save()
+            end
+            imgui.EndPopup()
+        end
+        K.tip('Click for a picker, right-click to reset.')
     end
-    bl_color('Top color', 'bluelearn_color_top', true)
-    imgui.SameLine(0, 16)
-    bl_color('Bottom', 'bluelearn_color_bottom', true)
-    bl_color('Outline', 'bluelearn_outline_color', true)
 
-    imgui.PushStyleColor(ImGuiCol_Button,        { 0.18, 0.24, 0.34, 1.0 })
-    imgui.PushStyleColor(ImGuiCol_ButtonHovered, { 0.24, 0.32, 0.46, 1.0 })
-    if imgui.Button('Test Splash##bluelearn', { 120, 0 }) then
-        M.splash_preview('Cursed Sphere')
+    local bl_off = (cfg.bluelearn_enabled == false)
+    K.section_begin('blu_splash', 'Action Learned Splash', pw)
+    if K.rows_begin('##blu_rows_splash') then
+        K.row('Show the splash', 'A centered "Action Learned!" splash with the spell name when YOU learn a Blue Magic spell.')
+        K.check('##bl_enabled', not bl_off, function(v) cfg.bluelearn_enabled = v end)
+
+        dis_begin(bl_off)
+        K.row('Play sound', 'Plays the learn sound with the splash.')
+        K.check('##bl_sound', cfg.bluelearn_play_sound ~= false, function(v) cfg.bluelearn_play_sound = v end)
+
+        K.row('Decorative lines', 'Draws the decorative lines above and below the text.')
+        K.check('##bl_rules', cfg.bluelearn_show_rules ~= false, function(v) cfg.bluelearn_show_rules = v end)
+
+        K.row('Duration', 'How long the splash stays on screen. Saved when you let go of the slider.')
+        K.slider('float', '##bl_dur', cfg.bluelearn_duration or 3.5, 1.0, 8.0, '%.1f s',
+            default_cfg and default_cfg.bluelearn_duration, function(v) cfg.bluelearn_duration = v end)
+
+        K.row('Vertical position', 'Where the splash sits: 0.00 is the top of the screen, 0.50 the middle.')
+        K.slider('float', '##bl_posy', cfg.bluelearn_pos_y or 0.28, 0.05, 0.90, '%.2f',
+            default_cfg and default_cfg.bluelearn_pos_y, function(v) cfg.bluelearn_pos_y = v end)
+
+        K.row('Font size', 'Height of the splash text.')
+        K.slider('int', '##bl_fh', math.floor(cfg.bluelearn_font_height or 46), 20, 80, '%d',
+            default_cfg and default_cfg.bluelearn_font_height, function(v) cfg.bluelearn_font_height = v end)
+
+        color_row('Top color',     'bluelearn_color_top',     'Gradient color at the top of the text.')
+        color_row('Bottom color',  'bluelearn_color_bottom',  'Gradient color at the bottom of the text.')
+        color_row('Outline color', 'bluelearn_outline_color', 'Color of the outline around the text.')
+        dis_end(bl_off)
+
+        K.row('Preview', 'Shows the splash now with a sample spell.')
+        if K.button('Test Splash##bluelearn') then M.splash_preview('Cursed Sphere') end
+        K.side('/blutracker test [spell]')
+        imgui.EndTable()
     end
-    imgui.PopStyleColor(2)
-    imgui.SameLine(0, 8)
-    imgui.PushStyleColor(ImGuiCol_Text, { 0.55, 0.58, 0.72, 1.0 })
-    imgui.Text('( or /blutracker test [spell] )')
-    imgui.PopStyleColor(1)
-
-    imgui.Separator()
+    K.section_end()
 
     -- ================= Spawn maps (mini-map + Zone tab) =================
-    imgui.PushStyleColor(ImGuiCol_Text, { 0.75, 0.78, 0.90, 1.0 })
-    imgui.Text('Spawn Maps:')
-    imgui.PopStyleColor(1)
+    K.section_begin('blu_maps', 'Maps', pw)
+    if K.rows_begin('##blu_rows_maps') then
+        K.row('Map scale', 'Size of the hover mini-maps (Spells / Tracker). The Zones tab map has its own size.')
+        K.slider('float', '##blu_mapscale', cfg.bluemage_map_scale or 1.0, 0.5, 3.0, '%.2fx',
+            default_cfg and default_cfg.bluemage_map_scale, function(v) cfg.bluemage_map_scale = v end)
 
-    imgui.PushItemWidth(200)
-    local ms = { cfg.bluemage_map_scale or 1.0 }
-    if imgui.SliderFloat('Map scale##bluemage', ms, 0.5, 3.0, '%.2fx') then
-        cfg.bluemage_map_scale = ms[1]; settings.save()
+        K.row('Player marker', 'Plots a marker at your live position on the map, only while you are standing in that zone.')
+        K.check('##blu_showplayer', cfg.bluemage_show_player ~= false, function(v) cfg.bluemage_show_player = v end)
+        imgui.EndTable()
     end
-    if imgui.IsItemHovered() then
-        imgui.SetTooltip('Size of the hover mini-maps (Spells / Tracker).\nThe Zone tab map has its own fixed size.')
-    end
-    imgui.PopItemWidth()
+    K.section_end()
 
-    local sp = { cfg.bluemage_show_player ~= false }
-    if imgui.Checkbox('Show player marker##bluemage', sp) then
-        cfg.bluemage_show_player = sp[1]; settings.save()
+    -- ================= Seen-in-chat counter =================
+    K.section_begin('blu_seen', 'Seen Counter', pw)
+    if K.rows_begin('##blu_rows_seen') then
+        K.row('Show in Tracker', 'Shows how many times each ability has been seen used in chat while BLU is your main job, by monsters claimed by you or your party/alliance. Stops once learned.')
+        K.check('##blu_showseen', cfg.bluemage_show_seen ~= false, function(v) cfg.bluemage_show_seen = v end)
+        imgui.EndTable()
     end
-    if imgui.IsItemHovered() then
-        imgui.SetTooltip('Plot a marker at your live position on the map,\nbut only while you are standing in that zone.')
-    end
+    K.section_end()
 
-    imgui.Separator()
-
-    -- Reset window settings (learned checkmarks come from the spellbook).
-    imgui.PushStyleColor(ImGuiCol_Button,        { 0.20, 0.18, 0.28, 1.0 })
-    imgui.PushStyleColor(ImGuiCol_ButtonHovered, { 0.30, 0.28, 0.42, 1.0 })
-    if imgui.Button('Reset Settings##bluemage', { 120, 0 }) then
-        M.reset_settings(default_cfg)
-        if vt.cfg_bluemage_font_scale    then vt.cfg_bluemage_font_scale[1]    = cfg.bluemage_font_scale end
-        if vt.cfg_bluemage_lock_ui       then vt.cfg_bluemage_lock_ui[1]       = cfg.bluemage_lock_ui end
-        if vt.cfg_bluemage_hide_on_menu  then vt.cfg_bluemage_hide_on_menu[1]  = cfg.bluemage_hide_on_menu end
-        if vt.cfg_bluemage_auto_learn    then vt.cfg_bluemage_auto_learn[1]    = cfg.bluemage_auto_learn end
-        if vt.cfg_bluemage_hide_learned  then vt.cfg_bluemage_hide_learned[1]  = cfg.bluemage_hide_learned end
-        if vt.cfg_bluemage_only_my_level then vt.cfg_bluemage_only_my_level[1] = cfg.bluemage_only_my_level end
-        if vt.cfg_bluemage_bg_color then
-            vt.cfg_bluemage_bg_color[1] = cfg.bluemage_bg_color_r
-            vt.cfg_bluemage_bg_color[2] = cfg.bluemage_bg_color_g
-            vt.cfg_bluemage_bg_color[3] = cfg.bluemage_bg_color_b
-            vt.cfg_bluemage_bg_color[4] = cfg.bluemage_bg_color_a
+    -- ================= Defaults =================
+    K.section_begin('blu_defaults', 'Defaults', pw)
+    if K.rows_begin('##blu_rows_defaults') then
+        K.row('All settings', 'Puts the window, splash, map and seen-counter options back to their defaults. Learned spells come from your spellbook and are not touched.')
+        if K.button('Reset##bluemage_reset_all') and default_cfg then
+            M.reset_settings(default_cfg)
+            if vt.cfg_bluemage_font_scale    then vt.cfg_bluemage_font_scale[1]    = cfg.bluemage_font_scale end
+            if vt.cfg_bluemage_lock_ui       then vt.cfg_bluemage_lock_ui[1]       = cfg.bluemage_lock_ui end
+            if vt.cfg_bluemage_auto_learn    then vt.cfg_bluemage_auto_learn[1]    = cfg.bluemage_auto_learn end
+            if vt.cfg_bluemage_hide_learned  then vt.cfg_bluemage_hide_learned[1]  = cfg.bluemage_hide_learned end
+            if vt.cfg_bluemage_only_my_level then vt.cfg_bluemage_only_my_level[1] = cfg.bluemage_only_my_level end
         end
+        imgui.EndTable()
     end
-    imgui.PopStyleColor(2)
+    K.section_end()
 
+    imgui.Dummy({ 0, 4 })   -- keep the last shadow inside the scroll area
     imgui.EndChild()
     imgui.PopStyleColor(1)   -- ChildBg
 end
@@ -2398,6 +4192,9 @@ function M.render()
     -- Drive the "Action Learned!" splash fade/queue every frame, before any
     -- of the window early-returns below.
     if BlueLearn then pcall(function() BlueLearn.render() end) end
+
+    -- Persist "seen" counts every so often (not on every chat line).
+    FlushSeen(false)
 
     -- Keep the learned checkmarks in sync with the player's spellbook. Runs
     -- regardless of which windows are open.
@@ -2428,14 +4225,16 @@ function M.render()
     RenderTracker()
 
     if not cfg.bluemage_open then return end
-    if cfg.bluemage_hide_on_menu and in_game_menu_open() then return end
 
     imgui.SetNextWindowSize({ WINDOW_WIDTH, WINDOW_HEIGHT }, ImGuiCond_FirstUseEver)
     imgui.SetNextWindowPos({ cfg.bluemage_win_x or 340, cfg.bluemage_win_y or 200 }, ImGuiCond_FirstUseEver)
 
     PushWindowTheme(BgColor())
 
-    local flags = ImGuiWindowFlags_NoScrollbar
+    -- No scrollbar AND no mouse-wheel scrolling: everything that scrolls lives
+    -- in its own child, so a wheel turn over a panel margin must not slide the
+    -- whole window (which pushed the tab bar out of view).
+    local flags = bit.bor(ImGuiWindowFlags_NoScrollbar, ImGuiWindowFlags_NoScrollWithMouse or 0)
     if cfg.bluemage_lock_ui then
         flags = bit.bor(flags, ImGuiWindowFlags_NoMove, ImGuiWindowFlags_NoResize)
     end
@@ -2443,43 +4242,54 @@ function M.render()
     local visible = { cfg.bluemage_open }
     local title = 'Blue Magic Tracker - V ' .. tostring((addon and addon.version) or '1.0')
     local begin_ok = imgui.Begin(title, visible, flags)
+    -- Undo any scroll the window already picked up (e.g. a saved offset).
+    pcall(function() if (imgui.GetScrollY() or 0) ~= 0 then imgui.SetScrollY(0) end end)
 
-    -- Title-bar gear jumps to the in-window Settings tab.
-    if helpers and helpers.draw_titlebar_gear then
-        helpers.draw_titlebar_gear('blu', 1.0, function()
-            if vt then vt._want_settings_tab = true end
-        end)
+    -- Tab to select this frame, if any: the gear (last tab), "/blutracker
+    -- config" (Settings), or the first draw after loading (last tab).
+    local want_tab = vt and vt._want_tab or nil
+    if vt and vt._want_settings_tab then want_tab = 'Settings' end
+    if vt and not vt._tab_restored then
+        vt._tab_restored = true
+        want_tab = want_tab or cfg.bluemage_last_tab
     end
+    local SETSEL = (type(ImGuiTabItemFlags_SetSelected) == 'number') and ImGuiTabItemFlags_SetSelected or 2
+    local function TabFlags(label) return (want_tab == label) and SETSEL or 0 end
 
-    if begin_ok and imgui.BeginTabBar('##blu_main_tabs', ImGuiTabBarFlags_None) then
-    if imgui.BeginTabItem('Spells') then
+    if begin_ok and UIK.tab_bar_begin('##blu_main_tabs') then
+    if UIK.tab_item('##blu_main_tabs', 'Spells', TabFlags('Spells')) then
         local bluLvl  = GetBluLevel()
         local skill   = GetBlueSkill()
         local total   = DB.COUNT
         local nLearn  = CountLearned()
         local frac    = (total > 0) and (nLearn / total) or 0
 
-        -- ---- Progress ----
-        imgui.PushStyleColor(ImGuiCol_Text, { 0.80, 0.90, 1.00, 1.0 })
+        -- ---- Progress (left-aligned): level / skill title, Learned, bar ----
+        local UI = UIK.UI
         if bluLvl then
             if skill then
-                imgui.Text(('Blue Mage   -   Lv %d   -   Blue Magic Skill %d'):format(bluLvl, skill))
+                UIK.heading(('Lv %d - Blue Magic Skill %d'):format(bluLvl, skill))
             else
-                imgui.Text(('Blue Mage   -   Lv %d'):format(bluLvl))
+                UIK.heading(('Lv %d'):format(bluLvl))
             end
         else
-            imgui.Text('Blue Mage')
-            imgui.SameLine(0, 8)
-            imgui.PushStyleColor(ImGuiCol_Text, { 0.55, 0.58, 0.72, 1.0 })
-            imgui.Text('(set BLU as main job to see learn readiness)')
-            imgui.PopStyleColor(1)
+            UIK.heading('(set BLU as main job to see learn readiness)', UI.dim)
         end
-        imgui.PopStyleColor(1)
 
-        imgui.PushStyleColor(ImGuiCol_Text, { 0.70, 0.73, 0.85, 1.0 })
-        imgui.Text(('Learned  %d / %d  (%d%%)'):format(nLearn, total, math.floor(frac * 100 + 0.5)))
-        imgui.PopStyleColor(1)
-        DrawProgressBar(frac, WINDOW_WIDTH - 24, 10)
+        UIK.text(UI.label, 'Learned')
+        imgui.SameLine(0, 8)
+        UIK.text(UI.value, ('%d / %d'):format(nLearn, total))
+        imgui.SameLine(0, 8)
+        UIK.text(UI.dim, ('(%d%%)'):format(math.floor(frac * 100 + 0.5)))
+        -- Same width as the spell-list panel below (all available width minus
+        -- the panel's drop shadow), so their right edges line up.
+        local barW = WINDOW_WIDTH - 24
+        pcall(function()
+            local a = imgui.GetContentRegionAvail()
+            if type(a) == 'number' and a > 0 then barW = a - UIK.SHADOW end
+        end)
+        DrawProgressBar(frac, barW, 10)
+
 
         imgui.Spacing()
 
@@ -2527,7 +4337,7 @@ function M.render()
         imgui.SameLine(0, 6)
         traitFilter = FilterCombo('Trait', '##bm_trait', traitFilter, DB.TRAITS,   150)
 
-        imgui.Separator()
+        imgui.Dummy({ 0, 1 })   -- (was a separator; keeps the same spacing)
 
         -- ---- Column headers (fixed above the scroll area) ----
         DrawHeaderRow()
@@ -2535,13 +4345,36 @@ function M.render()
         -- ---- Scrollable list ----
         local needle = (searchBuf[1] or ''):lower()
 
-        -- Height for the scroll region: window height minus the top block,
-        -- the detail panel, and the footer. GetWindowSize returns (w, h) here.
-        local _, winH = imgui.GetWindowSize()
-        local listH = (winH or WINDOW_HEIGHT) - 178 - DETAIL_HEIGHT - FOOTER_HEIGHT
+        -- Height for the scroll region: whatever is left at this point minus
+        -- exactly what's drawn below it (spacer, detail panel + its shadow,
+        -- spacer, legend line), so the footer is never cut off.
+        local sp, lh = 4, 14
+        pcall(function()
+            local st = imgui.GetStyle()
+            local v = st and st.ItemSpacing
+            local y = v and (v.y or v[2])
+            if type(y) == 'number' then sp = y end
+        end)
+        pcall(function()
+            local h = imgui.GetTextLineHeight()
+            if type(h) == 'number' then lh = h end
+        end)
+        local availH = nil
+        pcall(function()
+            local _, h = imgui.GetContentRegionAvail()
+            if type(h) == 'number' then availH = h end
+        end)
+        local below = sp + (1 + sp) + (DETAIL_HEIGHT + sp) + (1 + sp) + lh + UIK.SHADOW
+        local listH
+        if availH then
+            listH = math.floor(availH - below)
+        else
+            local _, winH = imgui.GetWindowSize()
+            listH = (winH or WINDOW_HEIGHT) - 178 - DETAIL_HEIGHT - FOOTER_HEIGHT
+        end
         if listH < 80 then listH = 80 end
 
-        imgui.BeginChild('##bm_list', { 0, listH })
+        UIK.frame_begin('##bm_list', 0, listH)
 
         SetupColumns('##bm_rows')
         local shown = 0
@@ -2559,14 +4392,14 @@ function M.render()
             imgui.PopStyleColor(1)
         end
 
-        imgui.EndChild()
+        UIK.frame_end()
 
         -- ---- Learned-from detail panel ----
-        imgui.Separator()
+        imgui.Dummy({ 0, 1 })   -- (was a separator; keeps the same spacing)
         DrawDetailPanel()
 
         -- ---- Footer ----
-        imgui.Separator()
+        imgui.Dummy({ 0, 1 })
         imgui.PushStyleColor(ImGuiCol_Text, { 0.50, 0.53, 0.66, 1.0 })
         imgui.Text(('Showing %d'):format(shown))
         imgui.PopStyleColor(1)
@@ -2586,36 +4419,59 @@ function M.render()
         imgui.PushStyleColor(ImGuiCol_Text, STATUS_COL.yellow)
         imgui.Text('Yellow = Raise Skill lvl to Learn')
         imgui.PopStyleColor(1)
-        imgui.SameLine(0, 10)
-        imgui.PushStyleColor(ImGuiCol_Text, { 0.50, 0.53, 0.66, 1.0 })
-        imgui.Text(spellbook_ok and '-   click a name for locations' or '-   spellbook read unavailable')
-        imgui.PopStyleColor(1)
-
-        imgui.Text('')   -- extra line of spacing below the legend
+        -- Only shown if the spellbook can't be read (learned marks come from chat).
+        if not spellbook_ok then
+            imgui.SameLine(0, 10)
+            imgui.PushStyleColor(ImGuiCol_Text, UIK.UI.warn)
+            imgui.Text('(spellbook read unavailable)')
+            imgui.PopStyleColor(1)
+        end
 
         imgui.EndTabItem()
     end  -- Spells tab
 
     -- Zones tab: search Blue Magic by zone, with a scalable map + player marker.
-    if imgui.BeginTabItem('Zones') then
+    if UIK.tab_item('##blu_main_tabs', 'Zones', TabFlags('Zones')) then
         RenderZoneTab()
         imgui.EndTabItem()
     end
 
-    -- Settings tab. The gear / "/blutracker config" set vt._want_settings_tab so we
-    -- programmatically select it here on the next frame.
-    local set_flags = 0
-    if vt and vt._want_settings_tab then
-        set_flags = (type(ImGuiTabItemFlags_SetSelected) == 'number')
-                    and ImGuiTabItemFlags_SetSelected or 2
-        vt._want_settings_tab = false
+    -- Traits tab: job-trait combinations + set-up designer.
+    if UIK.tab_item('##blu_main_tabs', 'Traits', TabFlags('Traits')) then
+        RenderTraitsTab()
+        imgui.EndTabItem()
     end
-    if imgui.BeginTabItem('Settings', nil, set_flags) then
+
+    -- Counter tab: seen-in-chat counts by ability or by monster.
+    if UIK.tab_item('##blu_main_tabs', 'Counter', TabFlags('Counter')) then
+        RenderCounterTab()
+        imgui.EndTabItem()
+    end
+
+    if UIK.tab_item('##blu_main_tabs', 'Settings', TabFlags('Settings')) then
         RenderConfigTab()
         imgui.EndTabItem()
     end
 
-    imgui.EndTabBar()
+    UIK.tab_bar_end()
+
+    -- Remember the tab you're on (for the gear and the next load). A
+    -- requested tab takes effect a frame later, so tracking pauses briefly
+    -- after one rather than recording the tab being switched away from.
+    if vt then
+        if want_tab then
+            vt._want_tab, vt._want_settings_tab = nil, false
+            vt._tab_settle = 2
+        elseif (vt._tab_settle or 0) > 0 then
+            vt._tab_settle = vt._tab_settle - 1
+        else
+            local sel = UIK.tab_selected('##blu_main_tabs')
+            if sel and sel ~= cfg.bluemage_last_tab then
+                cfg.bluemage_last_tab = sel
+                settings.save()
+            end
+        end
+    end
 
     -- Persist window position (applies regardless of the active tab).
     local px, py = imgui.GetWindowPos()
@@ -2657,6 +4513,8 @@ function M.command(e)
             settings.save()
         elseif a[2] == 'floors' then
             M.debug_floors()
+        elseif a[2] == 'seen' then
+            M.seen_command(a)
         else
             cfg.bluemage_open = not cfg.bluemage_open
             if vt and vt.cfg_bluemage_open then vt.cfg_bluemage_open[1] = cfg.bluemage_open end
@@ -2665,6 +4523,66 @@ function M.command(e)
         return true
     end
     return false
+end
+
+-- /blutracker seen                 list every ability you've seen (highest first)
+-- /blutracker seen reset           clear all counts
+-- /blutracker seen reset <spell>   clear one spell's count
+-- /blutracker seen debug           toggle a chat trace of what gets counted
+function M.seen_command(a)
+    if not seen then return end
+    if a[3] == 'debug' then
+        seen_debug = not seen_debug
+        print(('[BluTracker] Seen-counter debug %s.'):format(seen_debug and 'ON' or 'OFF'))
+        if seen_debug then
+            local off = CalibrateAbilityOffset()
+            print(('[BluTracker]   ability names from packets: %s'):format(
+                (off == 256 and 'OK (offset 256)') or (off == 0 and 'OK (offset 0)')
+                or 'unconfirmed (will try both, then chat)'))
+            print(('[BluTracker]   action packets seen this session: %s'):format(
+                packets_working and 'yes' or 'not yet'))
+            print(('[BluTracker]   BLU main job: %s'):format(GetBluLevel() and 'yes' or 'NO (counting paused)'))
+        end
+        return
+    end
+    if a[3] == 'reset' then
+        if #a >= 4 then
+            local key = DB.keyify(table.concat(a, ' ', 4))
+            local r = DB.BY_KEY[key]
+            if not r then
+                print(('[BluTracker] Unknown spell "%s".'):format(table.concat(a, ' ', 4)))
+                return
+            end
+            seen[key] = nil
+            SeenBy.data[key] = nil
+            print(('[BluTracker] Seen count cleared for %s.'):format(r.name))
+        else
+            for k in pairs(seen) do seen[k] = nil end
+            SeenBy.data = {}
+            print('[BluTracker] All seen counts cleared.')
+        end
+        seen_dirty = false
+        SeenBy.store()
+        settings.save()
+        return
+    end
+    local rows = {}
+    for _, r in ipairs(DB.SPELLS) do
+        local n = tonumber(seen[r.key]) or 0
+        if n > 0 then rows[#rows + 1] = { r.name, n, learned and learned[r.key] } end
+    end
+    if #rows == 0 then
+        print('[BluTracker] No Blue Magic abilities seen yet (counted while BLU is your main job).')
+        return
+    end
+    table.sort(rows, function(x, y)
+        if x[2] ~= y[2] then return x[2] > y[2] end
+        return x[1] < y[1]
+    end)
+    print('[BluTracker] Seen in chat while on BLU:')
+    for _, row in ipairs(rows) do
+        print(('    %-22s x%d%s'):format(row[1], row[2], row[3] and '  (learned)' or ''))
+    end
 end
 
 -- Diagnostic: print the current zone's map-floor geometry and how the currently
@@ -2726,6 +4644,9 @@ function M.text_in(e)
     -- Feed the "Action Learned!" splash first (independent of the fallback).
     if BlueLearn then pcall(function() BlueLearn.text_in(e) end) end
 
+    -- Count monster uses of Blue Magic abilities (independent of the fallback).
+    if cfg then pcall(CountSeen, e) end
+
     if not cfg or spellbook_ok then return end
     if cfg.bluemage_auto_learn == false then return end
     local msg = e.message or e.message_modified or e.text or ''
@@ -2758,6 +4679,7 @@ end
 
 function M.unload()
     if BlueLearn then pcall(function() BlueLearn.unload() end) end
+    seen_dirty = false
     if settings then settings.save() end
 end
 
@@ -2766,17 +4688,15 @@ end
 function M.reset_settings(default_config)
     cfg.bluemage_font_scale    = default_config.bluemage_font_scale
     cfg.bluemage_lock_ui       = default_config.bluemage_lock_ui
-    cfg.bluemage_hide_on_menu  = default_config.bluemage_hide_on_menu
     cfg.bluemage_auto_learn    = default_config.bluemage_auto_learn
     cfg.bluemage_hide_learned  = default_config.bluemage_hide_learned
     cfg.bluemage_only_my_level = default_config.bluemage_only_my_level
     cfg.bluemage_map_scale       = default_config.bluemage_map_scale
     cfg.bluemage_show_player     = default_config.bluemage_show_player
     cfg.bluemage_track_mode    = default_config.bluemage_track_mode
-    cfg.bluemage_bg_color_r    = default_config.bluemage_bg_color_r
-    cfg.bluemage_bg_color_g    = default_config.bluemage_bg_color_g
-    cfg.bluemage_bg_color_b    = default_config.bluemage_bg_color_b
-    cfg.bluemage_bg_color_a    = default_config.bluemage_bg_color_a
+    cfg.bluemage_show_seen     = default_config.bluemage_show_seen
+    cfg.bluemage_counter_hide_learned = default_config.bluemage_counter_hide_learned
+    cfg.bluemage_counter_show_unseen  = default_config.bluemage_counter_show_unseen
     -- "Action Learned!" splash appearance
     cfg.bluelearn_enabled       = default_config.bluelearn_enabled
     cfg.bluelearn_play_sound    = default_config.bluelearn_play_sound

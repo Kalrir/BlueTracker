@@ -14,6 +14,9 @@
 *   /blutracker config         open the window on its Settings tab (or: settings)
 *   /blutracker test [spell]   preview the "Action Learned!" splash
 *   /blutracker floors         print map-floor diagnostics for the current zone
+*   /blutracker seen           list how often you've seen each ability (on BLU)
+*   /blutracker seen reset [spell]   clear all seen counts, or just one spell's
+*   /blutracker seen debug     toggle a chat trace of what the counter sees
 *
 * Per-character state (learned spells, tracked spells, window options) is
 * saved by Ashita's settings library, so each character keeps its own data.
@@ -21,7 +24,7 @@
 
 addon.name    = 'BluTracker';
 addon.author  = 'Kalrir';
-addon.version = '1.14';
+addon.version = '1.20';
 addon.desc    = 'Blue Magic spell-learning tracker with a where-to-learn guide.';
 
 require('common');
@@ -40,9 +43,9 @@ local default_config = T{
     bluemage_open          = false,
     bluemage_win_x         = 340,
     bluemage_win_y         = 200,
+    bluemage_last_tab      = 'Spells',  -- main window tab used last (gear reopens it)
     bluemage_font_scale    = 1.0,
     bluemage_lock_ui       = false,
-    bluemage_hide_on_menu  = false,
     bluemage_auto_learn    = true,   -- chat fallback when the spellbook read is unavailable
     bluemage_hide_learned  = false,  -- filter: hide already-learned spells
     bluemage_only_my_level = false,  -- filter: only spells at/below your BLU level
@@ -50,16 +53,26 @@ local default_config = T{
     bluemage_map_scale       = 1.0,   -- size multiplier for the hover mini-maps
     bluemage_show_player     = true,  -- draw a marker at the player's live position
     bluemage_floorcache_str  = '',    -- persisted native map-floor cache (self-encoded)
-    bluemage_bg_color_r    = 0.06,
-    bluemage_bg_color_g    = 0.07,
-    bluemage_bg_color_b    = 0.10,
-    bluemage_bg_color_a    = 0.96,
     bluemage_data          = BlueMage.default_data,   -- per-char learned state
     -- Separate "tracker" mini-window
     bluemage_track_mode    = 'off',   -- 'off' | 'specific' | 'zone'
     bluemage_track_win_x   = 910,
     bluemage_track_win_y   = 200,
     bluemage_track_data    = BlueMage.default_track,
+    bluemage_show_seen     = true,    -- show the "seen in chat" count in the tracker
+    bluemage_seenby_str    = '',      -- per-monster seen counts (self-encoded)
+    bluemage_counter_hide_learned = false,  -- Counter tab: hide learned spells
+    bluemage_counter_show_unseen  = false,  -- Counter tab: list x0 abilities too
+
+    -- Traits tab designer
+    bluemage_trait_manual       = false,  -- false = max points from your BLU level
+    bluemage_trait_points       = 45,     -- manual max set points (when manual)
+    bluemage_trait_last_level   = 75,     -- last BLU level seen (used when not on BLU)
+    bluemage_trait_other        = 0,      -- points reserved for non-trait spells
+    bluemage_trait_only_learned = false,
+    bluemage_trait_only_level   = false,
+    bluemage_trait_can_combo    = false,
+    bluemage_trait_design       = T{},    -- sheet spell id -> true (selected)
 
     -- "Action Learned!" splash (BlueLearn). Colors are ARGB (0xAARRGGBB).
     bluelearn_enabled       = true,
@@ -89,13 +102,10 @@ local vt = {
     cfg_bluemage_open           = { cfg.bluemage_open },
     cfg_bluemage_font_scale     = { cfg.bluemage_font_scale },
     cfg_bluemage_lock_ui        = { cfg.bluemage_lock_ui },
-    cfg_bluemage_hide_on_menu   = { cfg.bluemage_hide_on_menu },
     cfg_bluemage_auto_learn     = { cfg.bluemage_auto_learn ~= false },
     cfg_bluemage_hide_learned   = { cfg.bluemage_hide_learned or false },
     cfg_bluemage_only_my_level  = { cfg.bluemage_only_my_level or false },
-    cfg_bluemage_bg_color       = { cfg.bluemage_bg_color_r, cfg.bluemage_bg_color_g,
-                                    cfg.bluemage_bg_color_b, cfg.bluemage_bg_color_a },
-    _want_settings_tab          = false,  -- set by the gear / "/blutracker config"
+    _want_settings_tab          = false,  -- set by the mini tracker's gear / "/blutracker config"
 };
 
 -- Push the current cfg values back into the vt {value} tables. Called on load
@@ -104,14 +114,9 @@ local function sync_config_vars()
     vt.cfg_bluemage_open[1]          = cfg.bluemage_open;
     vt.cfg_bluemage_font_scale[1]    = cfg.bluemage_font_scale;
     vt.cfg_bluemage_lock_ui[1]       = cfg.bluemage_lock_ui;
-    vt.cfg_bluemage_hide_on_menu[1]  = cfg.bluemage_hide_on_menu;
     vt.cfg_bluemage_auto_learn[1]    = cfg.bluemage_auto_learn ~= false;
     vt.cfg_bluemage_hide_learned[1]  = cfg.bluemage_hide_learned or false;
     vt.cfg_bluemage_only_my_level[1] = cfg.bluemage_only_my_level or false;
-    vt.cfg_bluemage_bg_color[1]      = cfg.bluemage_bg_color_r;
-    vt.cfg_bluemage_bg_color[2]      = cfg.bluemage_bg_color_g;
-    vt.cfg_bluemage_bg_color[3]      = cfg.bluemage_bg_color_b;
-    vt.cfg_bluemage_bg_color[4]      = cfg.bluemage_bg_color_a;
 end
 
 ------------------------------------------------------------
@@ -222,6 +227,10 @@ ashita.events.register('packet_in', 'packet_in_cb', function(e)
         BlueMage.init(make_host());
     elseif e.id == 0x00B then
         settings.save();
+    elseif e.id == 0x028 then
+        -- Action packet: tells the "seen" counter exactly which monster used
+        -- a TP move, so same-named mobs claimed by outsiders aren't counted.
+        pcall(BlueMage.packet_in, e);
     end
 end);
 
@@ -230,7 +239,7 @@ ashita.events.register('d3d_present', 'present_cb', function()
     if vt._load_msg_frames and vt._load_msg_frames > 0 then
         vt._load_msg_frames = vt._load_msg_frames - 1;
         if vt._load_msg_frames == 0 then
-            print('[BluTracker] loaded. /blutracker (or /blut) to open, /blutracker config for settings.');
+            print('[BluTracker] loaded. /blutracker (or /blut) to open.');
             vt._load_msg_frames = nil;
         end
     end
