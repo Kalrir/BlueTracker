@@ -4624,7 +4624,12 @@ local function RenderTraitDesigner(myLvl, used, count, per, chosen, pw)
             for k in pairs(d) do d[k] = nil end
             settings.save()
         end
+        imgui.SameLine(0, 8)
     end
+    -- Load Current Set sits next to Clear set-up (alone when the list is empty).
+    if K.button('Load Current Set##trt') then LoadCurrentSetClicked() end
+    K.tip('Load the Blue Magic spells you have set right now into Your Set-up (BLU main or support job). '
+        .. 'Every set spell is loaded, including ones with no job trait.')
     K.section_end()
 end
 
@@ -4649,10 +4654,6 @@ local function RenderTraitsTab()
             cfg.bluemage_trait_manual = v
             if v then cfg.bluemage_trait_points = math.min(maxpts, ManualMaxPoints()) end   -- start from the auto value
         end, 'On: type your own maximum instead of using your BLU level.')
-        imgui.SameLine(0, 14)
-        if K.button('Load Current Set##trt') then LoadCurrentSetClicked() end
-        K.tip('Load the Blue Magic spells you have set right now into Your Set-up (BLU main or support job). '
-            .. 'Every set spell is loaded, including ones with no job trait.')
 
         local nLearned = learnedCount or CountLearned()
         if cfg.bluemage_trait_manual then

@@ -21,7 +21,7 @@ M.TRAITS = {
     { name = 'Accuracy Bonus', need = 8,
       rule = 'Any 2 spells. Every 2 more spells adds a tier.',
       spells = {
-        { 28, 'Vanity Dive',       2, 4 },
+        { 28, 'Vanity Dive',       4, 4 },
         { 60, 'Dimensional Death', 5, 4 },
         { 63, 'Frenetic Rip',      3, 4 },
         { 72, 'Disseverment',      5, 4 },
@@ -45,8 +45,8 @@ M.TRAITS = {
         { 50, 'Self-Destruct',      3, 2 },
         { 52, 'Cold Wave',          1, 1 },
         { 56, 'Winds of Promyvion', 4, 2 },
-        { 58, 'Light of Penance',   5, 2 },
-        { 64, 'Voracious Trunk',    4, 3 },
+        { 58, 'Light of Penance',   5, 3 },
+        { 64, 'Voracious Trunk',    3, 3 },
         { 74, 'Actinic Burst',      4, 4 },
         { 75, 'Plasma Charge',      5, 4 },
       } },
@@ -81,7 +81,7 @@ M.TRAITS = {
         { 32, 'Chaotic Eye',   2, 4 },
         { 36, 'Digest',        2, 4 },
         { 65, 'Zephyr Mantle', 2, 4 },
-        { 66, 'Frost Breath',  3, 8 },
+        { 66, 'Frost Breath',  4, 8 },
         { 68, 'Firespit',      5, 4 },
       } },
     { name = 'Defense Bonus', need = 8,
@@ -90,6 +90,7 @@ M.TRAITS = {
         { 30, 'Grand Slam',          2, 4 },
         { 40, 'Terror Touch',        3, 4 },
         { 54, 'Quadratic Continuum', 4, 4 },
+        { 72, 'Saline Coat',         3, 4 },
         { 75, 'Vertical Cleave',     3, 4 },
       } },
     { name = 'Evasion Bonus', need = 8, max = 1,
@@ -97,7 +98,7 @@ M.TRAITS = {
       spells = {
         { 26, 'Screwdriver',      3, 4 },
         { 38, 'Occultation',      3, 4 },
-        { 72, 'Hysteric Barrage', 5, 4 },
+        { 69, 'Hysteric Barrage', 5, 4 },
       } },
     { name = 'Magic Attack Bonus', need = 8,
       rule = 'Any 2 spells. Every 2 more spells adds a tier.',
@@ -187,6 +188,29 @@ M.TRAITS = {
       spells = {
         { 42, 'Auroral Drape', 4, 4 },
         { 61, 'Bad Breath',    5, 4 },
+      } },
+    -- Added from the in-game spell cards (Oct 2026): traits these spells give
+    -- that were missing from the sheet.
+    { name = 'Store TP', need = 8, max = 1,
+      rule = 'Both spells.',
+      spells = {
+        { 48, 'Sickle Slash', 4, 4 },
+        { 69, 'Tail Slap',    4, 4 },
+      } },
+    { name = 'Counter', need = 8, max = 1,
+      rule = 'Needs 8 trait points.',
+      spells = {
+        { 67, 'Enervation', 5, 4 },
+      } },
+    { name = 'Resist Gravity', need = 8, max = 1,
+      rule = 'Needs 8 trait points.',
+      spells = {
+        { 56, 'Feather Barrier', 2, 4 },
+      } },
+    { name = 'Resist Slow', need = 8, max = 1,
+      rule = 'Needs 8 trait points.',
+      spells = {
+        { 48, 'Refueling', 4, 4 },
       } },
 }
 
