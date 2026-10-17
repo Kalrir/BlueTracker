@@ -10,7 +10,7 @@
 * naturally tracked per character).
 *
 * The main "Blue Magic" window carries five tabs: "Spells" (this tracker),
-* "Zones", "Traits", "Counter" (seen counts by ability / monster) and
+* "Zones", "Presets", "Counter" (seen counts by ability / monster) and
 * "Settings" (the config UI). The mini tracker's title-bar gear toggles the
 * window on the last tab used; `/blutracker config` jumps to the Settings tab.
 *
@@ -469,6 +469,7 @@ M.default_window = {
     bluemage_auto_learn    = true,
     bluemage_hide_learned  = false,
     bluemage_only_my_level = false,
+    bluemage_only_my_skill = false,
     bluemage_map_scale       = 1.0,
     bluemage_show_player     = true,
 }
@@ -1278,8 +1279,12 @@ local function CleanText(s)
 end
 
 -- Does this spell pass the current filter set?
-local function PassesFilter(r, needle, bluLvl)
+local function PassesFilter(r, needle, bluLvl, skill)
     if cfg.bluemage_hide_learned and learned[r.key] then return false end
+    -- "<= Skill level": only spells your current Blue Magic skill can learn
+    -- (skill >= the spell's required skill). No effect unless BLU is your main
+    -- job and the skill can be read.
+    if cfg.bluemage_only_my_skill and bluLvl and skill and (REQSK[r.key] or 0) > skill then return false end
     if cfg.bluemage_only_my_level and bluLvl and r.lvl > bluLvl then return false end
     if roleFilter  ~= 'All' and r.role  ~= roleFilter  then return false end
     if traitFilter ~= 'All' and r.trait ~= traitFilter then return false end
@@ -2673,6 +2678,10 @@ local function ApplyChatMatch(a, key)
 end
 
 function M.packet_in(e)
+    if e.id == 0x044 then
+        if M._trt_packet then pcall(M._trt_packet, e) end
+        return
+    end
     if e.id ~= 0x028 or not seen then return end
     if GetBluLevel() == nil then return end
     local a = ParseAction(e.data)
@@ -2878,6 +2887,11 @@ local function MinLvl(s)
     local n = tostring(s):match('^%d+')
     return n and tonumber(n) or 0
 end
+-- Trailing number of a level string ("3-8" -> 8, "33" -> 33).
+local function MaxLvl(s)
+    local n = tostring(s):match('(%d+)%D*$')
+    return n and tonumber(n) or MinLvl(s)
+end
 
 -- A collapsible entry: header line (click to expand) + an indented mob list.
 --   mobs      : array of { mob, level [, zone] }
@@ -2905,22 +2919,18 @@ local function TrackerEntry(r, bluLvl, skill, mobs, show_zone, zone_name)
         return
     end
 
-    -- Sorted copy: Area, Mob, then Lvl. Zone mode has a single area (shown in
-    -- the header) so it lists Mob, Lvl only.
+    -- Sorted copy: lowest level first ("3-8" sorts by 3, then by 8), then
+    -- mob name, then area.
     local rows = {}
     for _, m in ipairs(mobs) do rows[#rows + 1] = m end
-    if show_zone then
-        table.sort(rows, function(a, b)
-            if (a[3] or '') ~= (b[3] or '') then return (a[3] or '') < (b[3] or '') end
-            if a[1] ~= b[1] then return a[1] < b[1] end
-            return MinLvl(a[2]) < MinLvl(b[2])
-        end)
-    else
-        table.sort(rows, function(a, b)
-            if a[1] ~= b[1] then return a[1] < b[1] end
-            return MinLvl(a[2]) < MinLvl(b[2])
-        end)
-    end
+    table.sort(rows, function(a, b)
+        local la, lb = MinLvl(a[2]), MinLvl(b[2])
+        if la ~= lb then return la < lb end
+        local ha, hb = MaxLvl(a[2]), MaxLvl(b[2])
+        if ha ~= hb then return ha < hb end
+        if a[1] ~= b[1] then return a[1] < b[1] end
+        return (a[3] or '') < (b[3] or '')
+    end)
 
     -- Aligned columns via measured text widths + absolute SameLine, so each
     -- column sits after the widest entry in the one before it (no overlap, and
@@ -3354,8 +3364,33 @@ do
     end
 end
 
+-- Every spell the designer can hold: the trait-sheet entries (by sheet id)
+-- plus every other Blue Magic spell (by DB key) with no job trait, so a
+-- whole in-game set (Cocoon, Head Butt, nukes...) fits in Your Set-up.
+-- Costs: trait sheet first, else data/bluemage_setpoints.lua.
+local ok_bp, BP = pcall(require, 'data/bluemage_setpoints')
+if not ok_bp or type(BP) ~= 'table' then BP = {} end
+local ALL_BY_ID = {}   -- id -> spell entry { lvl, name, cost, pts, rec, id, extra }
+local EXTRAS    = {}   -- non-trait spells, in level order (more added on the fly)
+do
+    local on_sheet = {}
+    for _, t in ipairs(TRAITS) do
+        for _, s in ipairs(t.spells) do
+            if not ALL_BY_ID[s.id] then ALL_BY_ID[s.id] = s end
+            if s.rec then on_sheet[s.rec.key] = true end
+        end
+    end
+    for _, r in ipairs(SORTED) do
+        if not on_sheet[r.key] and not ALL_BY_ID[r.key] then
+            local e = { lvl = r.lvl, name = r.name, cost = BP[r.key] or 0, pts = 0,
+                        rec = r, id = r.key, extra = true }
+            ALL_BY_ID[r.key] = e
+            EXTRAS[#EXTRAS + 1] = e
+        end
+    end
+end
+
 local trait_open     = {}   -- trait name -> expanded?
-local trait_all_open = {}   -- trait name -> "all combinations" list expanded?
 local trait_cache    = {}   -- trait name -> { sig, result }
 
 local ROMAN = { 'I', 'II', 'III', 'IV', 'V', 'VI', 'VII', 'VIII', 'IX', 'X' }
@@ -3483,6 +3518,12 @@ local function DesignTotals()
         end
         per[t.name] = pts
     end
+    for _, s in ipairs(EXTRAS) do       -- spells with no job trait
+        if d[s.id] then
+            used = used + s.cost; count = count + 1
+            chosen[#chosen + 1] = { t = nil, s = s }
+        end
+    end
     return used, count, per, chosen
 end
 
@@ -3502,14 +3543,52 @@ local function TextC(col, s)
     imgui.PushStyleColor(ImGuiCol_Text, col); imgui.Text(s); imgui.PopStyleColor(1)
 end
 
--- One trait's expanded body: rule text, spell table, cheapest/all combos.
+-- Spells-tab style details for a Presets spell (nil when it isn't in the DB).
+--   type "Magical - Enfeeble" / "Physical - Damage", element (Fire / Slashing /
+--   Ranged...), effect, MP.
+local function SpellInfo(s)
+    local r = s and s.rec
+    if not r then return nil end
+    return {
+        typ  = ((r.kind == 'Phys') and 'Physical' or 'Magical') .. ' - ' .. (r.role or '?'),
+        tcol = ROLE_COLORS[r.role] or COL_TEXT,
+        elem = r.elem or '-',
+        ecol = ELEM_COLORS[r.elem] or COL_TEXT,
+        eff  = (r.prop and r.prop ~= '') and r.prop or '-',
+        mp   = r.mp and tostring(r.mp) or '?',
+    }
+end
+
+-- Hover card for a Presets spell: name, type, element, effect, MP, cost,
+-- trait, then learned / blocked status.
+local function SpellTooltip(s, block, isL, trait_line)
+    local i = SpellInfo(s)
+    imgui.BeginTooltip()
+    imgui.Text(s.name)
+    imgui.Separator()
+    if i then
+        TextC(i.tcol, i.typ)
+        TextC(i.ecol, 'Element: ' .. i.elem)
+        TextC(COL_TEXT, 'Effect: ' .. i.eff)
+        TextC(COL_TEXT, 'MP: ' .. i.mp)
+    else
+        TextC(COL_GREY, 'Not in the Horizon spell list')
+    end
+    TextC(COL_TEXT, ('Set points: %s'):format(tostring(s.cost)))
+    if trait_line then TextC(COL_TEXT, trait_line) end
+    imgui.Separator()
+    TextC(block and COL_WARN or (isL and COL_GOOD or COL_DIM), block or (isL and 'Learned' or 'Not learned yet'))
+    imgui.EndTooltip()
+end
+
+-- One trait's expanded body: optional note, spell table, cheapest cost per tier.
 local function RenderTraitBody(t, visible, myLvl, learnedCount)
     local K, d = UIK, Design()
     imgui.Indent(12)
-    if t.rule and t.rule ~= '' then K.note(t.rule) end
     if t.note then TextC(COL_WARN, t.note) end
 
-    -- Spell table: Set | Lv | Spell | Cost | Pts, sized to the panel.
+    -- Spell table: Set | Lv | Spell | Cost | Pts, sized to the panel (spell
+    -- details are in the hover card).
     local tw = math.max(160, K.inner_width() - 12)
     if imgui.BeginTable('##trtcols_' .. t.name, 5, ImGuiTableFlags_SizingFixedFit or 0, { tw, 0 }) then
         imgui.TableSetupColumn('set',   ImGuiTableColumnFlags_WidthFixed or 0, 30)
@@ -3542,9 +3621,7 @@ local function RenderTraitBody(t, visible, myLvl, learnedCount)
             local col = block and COL_GREY or (isL and COL_GOOD or COL_TEXT)
             TextC(col, s.name .. (isL and '  [X]' or ''))
             if imgui.IsItemHovered() then
-                local tip = block or (isL and 'Learned' or 'Not learned yet')
-                if not s.rec then tip = tip .. '\n(not in the Horizon spell list)' end
-                imgui.SetTooltip(tip)
+                SpellTooltip(s, block, isL, ('%s: %d trait pts'):format(t.name, s.pts))
             end
             imgui.TableSetColumnIndex(3)
             imgui.AlignTextToFramePadding()
@@ -3561,57 +3638,107 @@ local function RenderTraitBody(t, visible, myLvl, learnedCount)
     if #res.cheapest == 0 then
         TextC(COL_WARN, 'No usable combination with the current filters.')
     else
-        TextC(COL_SUBHEAD, 'Cheapest per tier  (click to use in your set-up):')
         for k, cmb in ipairs(res.cheapest) do
             local tl = (t.max == 1) and '' or ('Tier %-4s '):format(Roman(k))
-            local line = ('  %scost %2d   %s'):format(tl, cmb.cost, ComboText(cmb.list))
+            -- Overall set-point cost per tier only (no spell names); clicking
+            -- still loads that cheapest combination into Your Set-up.
+            local line = ('  %scost %d'):format(tl, cmb.cost)
             imgui.PushStyleColor(ImGuiCol_Text, COL_TIER)
             if imgui.Selectable(line .. '##trtch_' .. t.name .. k, false) then UseCombo(t, cmb.list) end
             imgui.PopStyleColor(1)
-        end
-
-        -- Every tier-I combination.
-        local aopen = trait_all_open[t.name] and true or false
-        local alabel = ('%s All %s combinations (%d)'):format(aopen and '[-]' or '[+]',
-            (t.max == 1) and 'valid' or 'tier I', #res.minimal)
-        imgui.PushStyleColor(ImGuiCol_Text, COL_DIM)
-        if imgui.Selectable(alabel .. '##trtall_' .. t.name, aopen) then trait_all_open[t.name] = not aopen end
-        imgui.PopStyleColor(1)
-        if aopen then
-            for i, cmb in ipairs(res.minimal) do
-                local line = ('     cost %2d   %s%s'):format(cmb.cost, ComboText(cmb.list),
-                    (t.need ~= 8 or cmb.pts ~= 8) and ('   (%d trait pts)'):format(cmb.pts) or '')
-                imgui.PushStyleColor(ImGuiCol_Text, COL_TEXT)
-                if imgui.Selectable(line .. '##trtmin_' .. t.name .. i, false) then UseCombo(t, cmb.list) end
-                imgui.PopStyleColor(1)
-            end
         end
     end
     imgui.Unindent(12)
 end
 
+-- Search box text for the Presets tab's left pane (Trait Sets + No Traits).
+local trt_search = { '' }
+-- Screen x / width of the Trait Sets card (last frame), so the search box
+-- above it lines up with the card exactly.
+local trt_card = nil
+
+local function SearchNeedle()
+    return ((trt_search[1] or ''):gsub('^%s+', ''):gsub('%s+$', '')):lower()
+end
+
+local function NameHit(name, needle)
+    return needle == '' or tostring(name):lower():find(needle, 1, true) ~= nil
+end
+
+-- Element dropdown + Magic / Physical / Ranged checkboxes under the search
+-- box (session-only, like the search). 'None' = no element filter. With no
+-- type box ticked every type shows; ticked boxes combine as "any of".
+local TRT_ELEMENTS = { 'None', 'Fire', 'Ice', 'Wind', 'Earth', 'Thunder', 'Water', 'Light', 'Dark' }
+local trt_elem = 'None'
+local trt_kind = { magic = false, phys = false, ranged = false }
+
+local function KindHit(s)
+    local r = s.rec
+    local any = trt_kind.magic or trt_kind.phys or trt_kind.ranged
+    if not r then return trt_elem == 'None' and not any end
+    if trt_elem ~= 'None' and r.elem ~= trt_elem then return false end
+    if not any then return true end
+    local ranged = (r.elem == 'Ranged')
+    if trt_kind.magic  and r.kind ~= 'Phys' then return true end
+    if trt_kind.phys   and r.kind == 'Phys' and not ranged then return true end
+    if trt_kind.ranged and ranged then return true end
+    return false
+end
+
+-- Any search / element / type filter in use?
+local function FiltersActive(needle)
+    return needle ~= '' or trt_elem ~= 'None' or trt_kind.magic or trt_kind.phys or trt_kind.ranged
+end
+
+-- While filtering, matching traits start collapsed and open on click; that
+-- open state is forgotten whenever the filters change (everything starts
+-- collapsed again for the new search / element / type).
+local filter_open, filter_sig = {}, nil
+local function FilterSig(needle)
+    return table.concat({ needle, trt_elem, tostring(trt_kind.magic), tostring(trt_kind.phys),
+        tostring(trt_kind.ranged) }, '|')
+end
+
 local function RenderTraitReference(myLvl, learnedCount, per, pw)
     local K = UIK
+    local needle = SearchNeedle()
+    local sig = FilterSig(needle)
+    if sig ~= filter_sig then filter_sig = sig; filter_open = {} end
+    pcall(function()
+        local x = imgui.GetCursorScreenPos()
+        if type(x) == 'number' then trt_card = { x = x, w = pw } end
+    end)
     K.section_begin('trt_ref', 'Trait Sets', pw)
     local shown = 0
     if K.block_begin('##trt_ref_block') then
         for _, t in ipairs(TRAITS) do
             -- Spells left after the filters; skip the whole category when
-            -- none of its spells survive.
+            -- none of its spells survive. A search matching the trait name
+            -- keeps all its spells; otherwise only matching spells stay.
             local combo = cfg.bluemage_trait_can_combo and TraitCombos(t, myLvl, learnedCount) or nil
+            local whole = (needle ~= '') and NameHit(t.name, needle)
+            local filtering = FiltersActive(needle)
             local visible = {}
             for _, s in ipairs(t.spells) do
-                if not TraitSpellHidden(s, myLvl) and (not combo or combo.used[s.id]) then
+                if not TraitSpellHidden(s, myLvl) and (not combo or combo.used[s.id])
+                   and (whole or NameHit(s.name, needle)) and KindHit(s) then
                     visible[#visible + 1] = s
                 end
             end
             if #visible > 0 then
                 shown = shown + 1
-                local open = trait_open[t.name] and true or false
+                -- While searching / filtering, matching traits start collapsed
+                -- (filter_open); otherwise the user's trait_open state rules.
+                local open
+                if filtering then open = filter_open[t.name] and true or false
+                else open = trait_open[t.name] and true or false end
                 local tier = TierOf(t, per[t.name] or 0)
                 local label = (open and '[-] ' or '[+] ') .. t.name
                 imgui.PushStyleColor(ImGuiCol_Text, COL_HEAD)
-                if imgui.Selectable(label .. '##trt_' .. t.name, open) then trait_open[t.name] = not open end
+                if imgui.Selectable(label .. '##trt_' .. t.name, open) then
+                    if filtering then filter_open[t.name] = (not open) or nil
+                    else trait_open[t.name] = not open end
+                end
                 imgui.PopStyleColor(1)
                 if tier > 0 then
                     -- "- Lv N" right after the trait name, drawn on the row so the
@@ -3636,13 +3763,131 @@ local function RenderTraitReference(myLvl, learnedCount, per, pw)
             end
         end
         if shown == 0 then
-            TextC(COL_DIM, cfg.bluemage_trait_can_combo
-                and 'No trait can be made with the current filters yet.'
-                or  'No known trait spells at or below your level yet.')
+            TextC(COL_DIM, FiltersActive(needle) and 'No trait spells match your filters.'
+                or cfg.bluemage_trait_can_combo and 'No trait can be made with the current filters yet.'
+                or 'No known trait spells at or below your level yet.')
         end
         K.block_end()
     end
     K.section_end()
+end
+
+-- "No Traits": every Blue Magic spell that gives no job trait (nukes,
+-- cures, Cocoon...), tickable into Your Set-up like the trait spells.
+local function RenderNoTraits(myLvl, pw)
+    local K, d = UIK, Design()
+    local needle = SearchNeedle()
+    local list = {}
+    for _, s in ipairs(EXTRAS) do
+        if not TraitSpellHidden(s, myLvl) and NameHit(s.name, needle) and KindHit(s) then list[#list + 1] = s end
+    end
+    K.section_begin('trt_notrait', ('No Traits (%d)'):format(#list), pw)
+    if #list == 0 then
+        K.note(FiltersActive(needle) and 'No spells without a trait match your filters.'
+            or 'No spells without a trait at or below your level yet.')
+    elseif K.block_begin('##trt_notrait_block') then
+        local tw = math.max(160, K.inner_width())
+        if imgui.BeginTable('##trt_notrait_cols', 4, ImGuiTableFlags_SizingFixedFit or 0, { tw, 0 }) then
+            imgui.TableSetupColumn('set',   ImGuiTableColumnFlags_WidthFixed or 0, 30)
+            imgui.TableSetupColumn('lv',    ImGuiTableColumnFlags_WidthFixed or 0, 30)
+            imgui.TableSetupColumn('spell', ImGuiTableColumnFlags_WidthStretch or 0)
+            imgui.TableSetupColumn('cost',  ImGuiTableColumnFlags_WidthFixed or 0, 36)
+            imgui.TableNextRow()
+            for i, h in ipairs({ 'Set', 'Lv', 'Spell', 'Cost' }) do
+                imgui.TableSetColumnIndex(i - 1); TextC(COL_COLHEAD, h)
+            end
+            for _, s in ipairs(list) do
+                local block = TraitSpellBlock(s, myLvl)
+                imgui.TableNextRow()
+                imgui.TableSetColumnIndex(0)
+                if s.lvl > ERA_CAP then
+                    TextC(COL_GREY, ' -')
+                else
+                    local v = { d[s.id] and true or false }
+                    if imgui.Checkbox('##trtnt_' .. s.id, v) then
+                        d[s.id] = v[1] or nil; settings.save()
+                    end
+                end
+                imgui.TableSetColumnIndex(1)
+                imgui.AlignTextToFramePadding()
+                TextC(block and COL_GREY or COL_TEXT, (s.lvl and s.lvl > 0) and tostring(s.lvl) or '?')
+                imgui.TableSetColumnIndex(2)
+                imgui.AlignTextToFramePadding()
+                local isL = s.rec and learned and learned[s.rec.key]
+                TextC(block and COL_GREY or (isL and COL_GOOD or COL_TEXT), s.name .. (isL and '  [X]' or ''))
+                if imgui.IsItemHovered() then SpellTooltip(s, block, isL, 'No job trait') end
+                imgui.TableSetColumnIndex(3)
+                imgui.AlignTextToFramePadding()
+                TextC(block and COL_GREY or COL_TEXT, tostring(s.cost))
+            end
+            imgui.EndTable()
+        end
+        K.block_end()
+    end
+    K.section_end()
+end
+
+-- Search box over the left pane; filters Trait Sets and No Traits.
+local function RenderSpellSearch(w)
+    local K = UIK
+    local has = (trt_search[1] or '') ~= ''
+    local clear_w = has and 26 or 0
+    -- Same left edge and width as the Trait Sets card below it.
+    local total = w - K.SHADOW
+    if trt_card then
+        pcall(function()
+            local _, cy = imgui.GetCursorScreenPos()
+            if type(cy) == 'number' then imgui.SetCursorScreenPos({ trt_card.x, cy }) end
+        end)
+        total = trt_card.w
+    end
+    imgui.SetNextItemWidth(math.max(80, total - (has and (clear_w + 6) or 0)))
+    imgui.InputText('##trt_search', trt_search, 64)
+    if has then
+        imgui.SameLine(0, 6)
+        if K.button('X##trt_search_clear', clear_w) then trt_search[1] = '' end
+    end
+end
+
+-- Width that fits the longest "Element: X" label plus the arrow button.
+local function ElementComboWidth()
+    local w = 150
+    pcall(function()
+        local m = 0
+        for _, e in ipairs(TRT_ELEMENTS) do
+            local x = imgui.CalcTextSize('Element: ' .. e)
+            if type(x) == 'number' and x > m then m = x end
+        end
+        local fh = imgui.GetFrameHeight()
+        if m > 0 and type(fh) == 'number' then w = math.floor(m + fh + 16) end
+    end)
+    return w
+end
+
+-- Element dropdown (first item on the Spell type row of Blue Points & Filters).
+local function RenderElementFilter(w)
+    imgui.SetNextItemWidth(w)
+    if imgui.BeginCombo('##trt_elem', 'Element: ' .. trt_elem) then
+        for _, e in ipairs(TRT_ELEMENTS) do
+            imgui.PushStyleColor(ImGuiCol_Text, ELEM_COLORS[e] or COL_TEXT)
+            if imgui.Selectable(e .. '##trt_elem_' .. e, trt_elem == e) then trt_elem = e end
+            imgui.PopStyleColor(1)
+        end
+        imgui.EndCombo()
+    end
+end
+
+-- Magic / Physical / Ranged boxes (Spell type row, after the Element dropdown).
+local function RenderTypeFilters()
+    local function box(label, key)
+        local v = { trt_kind[key] and true or false }
+        if imgui.Checkbox(label, v) then trt_kind[key] = v[1] end
+    end
+    box('Magic##trt_k_mag', 'magic')
+    imgui.SameLine(0, 14)
+    box('Physical##trt_k_phys', 'phys')
+    imgui.SameLine(0, 14)
+    box('Ranged##trt_k_rng', 'ranged')
 end
 
 -- ---------- Max Blue Magic set points ----------
@@ -3700,19 +3945,630 @@ local function MaxBluePoints()
     return base + bonus, expl, lvl, which
 end
 
+-- ---------- Saved set-ups + Apply to the game ----------
+-- Save / Load keep named copies of the designer selection (per character, in
+-- cfg.bluemage_trait_sets). Apply sets the set-up's spells in game, BLUSets
+-- style: one spell change per server round-trip.
+--
+-- Packets (LSB / HorizonXI):
+--   out 0x102  set/unset a Blue Magic spell. 0x04 = spell to add (id - 0x200,
+--              0 = removing), 0x08 = job (16), 0x0C..0x1F = the 20 slots:
+--              the target slot holds a non-zero byte (when removing, the id
+--              - 0x200 of the spell in that slot). All-zero = no change; the
+--              server just answers with 0x044, which we use as a refresh.
+--   in  0x044  job extra data. 0x04 = job; for BLU 0x08..0x1B = set spells.
+local BLU_SLOTS    = 20
+local SET_SPEED    = 0.65     -- seconds between spell changes (as BLUSets)
+local REPLY_WAIT   = 2.5      -- seconds to wait for the server's 0x044
+local SET_NAME_MAX = 32
+
+-- Sheet spell id -> sheet entry, and the spell-index (id - 0x200) of every
+-- trait-sheet spell (the ones Apply manages; other set spells are kept).
+local SHEET_BY_ID, IDX_KEY, SHEET_ID_OF_IDX = ALL_BY_ID, {}, {}
+for key, id in pairs(SID) do IDX_KEY[id - 0x200] = key end
+local function IndexSpell(s)
+    local sid = s.rec and SID[s.rec.key]
+    if sid then
+        s.idx = sid - 0x200
+        if not SHEET_ID_OF_IDX[s.idx] then SHEET_ID_OF_IDX[s.idx] = s.id end
+    end
+end
+for _, t in ipairs(TRAITS) do for _, s in ipairs(t.spells) do IndexSpell(s) end end
+for _, s in ipairs(EXTRAS) do IndexSpell(s) end
+
+local function IdxName(idx)
+    local key = IDX_KEY[idx]
+    local r = key and DB.BY_KEY[key]
+    return r and r.name or ('spell #%d'):format(idx + 0x200)
+end
+
+-- Designer id for a spell index read from the game. A spell missing from
+-- the database (e.g. one added by a server update) is added as a no-trait
+-- spell named from the client's resources, so Load Current Set gets it all.
+local function IdOfIdx(idx)
+    if not idx or idx == 0 then return nil end
+    local id = SHEET_ID_OF_IDX[idx]
+    if id then return id end
+    local name
+    pcall(function()
+        local sp = AshitaCore:GetResourceManager():GetSpellById(idx + 0x200)
+        name = sp and sp.Name and sp.Name[1]
+    end)
+    if type(name) ~= 'string' or name == '' then name = IdxName(idx) end
+    local key = DB.keyify(name)
+    if key == '' then key = 'spell' .. (idx + 0x200) end
+    local e = ALL_BY_ID[key]
+    if not e then
+        e = { lvl = 0, name = name, cost = BP[key] or 0, pts = 0, id = key, extra = true, idx = idx }
+        ALL_BY_ID[key] = e
+        EXTRAS[#EXTRAS + 1] = e
+    end
+    SHEET_ID_OF_IDX[idx] = key
+    return key
+end
+
+local function SavedSets()
+    if type(cfg.bluemage_trait_sets) ~= 'table' then cfg.bluemage_trait_sets = T{} end
+    return cfg.bluemage_trait_sets
+end
+
+local function FindSet(name)
+    local lname = (name or ''):lower()
+    for i, e in ipairs(SavedSets()) do
+        if type(e) == 'table' and tostring(e.name or ''):lower() == lname then return i, e end
+    end
+    return nil
+end
+
+-- Selected sheet ids of the designer, sorted.
+local function DesignIds()
+    local ids = {}
+    -- (ids no longer on the trait sheet, e.g. after a data fix, are ignored)
+    for id, on in pairs(Design()) do if on and SHEET_BY_ID[id] then ids[#ids + 1] = id end end
+    table.sort(ids)
+    return ids
+end
+
+local function SaveSetup(name)
+    local sets = SavedSets()
+    local ids = T{}
+    for _, id in ipairs(DesignIds()) do ids[#ids + 1] = id end
+    local entry = T{ name = name, ids = ids }
+    local i = FindSet(name)
+    if i then sets[i] = entry else sets[#sets + 1] = entry end
+    table.sort(sets, function(a, b) return tostring(a.name):lower() < tostring(b.name):lower() end)
+    cfg.bluemage_trait_loaded = name
+    settings.save()
+    print(('[BluTracker] Set-up "%s" saved (%d spells).'):format(name, #ids))
+end
+
+local function LoadSetup(e)
+    local d = Design()
+    for k in pairs(d) do d[k] = nil end
+    local n = 0
+    for _, id in ipairs(e.ids or {}) do
+        if SHEET_BY_ID[id] then d[id] = true; n = n + 1 end
+    end
+    cfg.bluemage_trait_loaded = e.name
+    settings.save()
+    print(('[BluTracker] Set-up "%s" loaded (%d spells). Press Apply to set them.'):format(tostring(e.name), n))
+end
+
+local function DeleteSetup(i)
+    local sets = SavedSets()
+    local e = sets[i]
+    if not e then return end
+    table.remove(sets, i)
+    if cfg.bluemage_trait_loaded == e.name then cfg.bluemage_trait_loaded = nil end
+    settings.save()
+    print(('[BluTracker] Set-up "%s" deleted.'):format(tostring(e.name)))
+end
+
+-- True when the designer still matches the saved set-up it was loaded from.
+local function MatchesSaved(e, ids)
+    if not e or #(e.ids or {}) ~= #ids then return false end
+    local have = {}
+    for _, id in ipairs(ids) do have[id] = true end
+    for _, id in ipairs(e.ids) do if not have[id] then return false end end
+    return true
+end
+
+-- ---- Applier ----
+local AP = {
+    current = nil,      -- slot (1..20) -> spell index (0 = empty), from 0x044
+    running = false,
+    status  = nil,      -- { text, col } shown under the buttons
+}
+
+local function SendBlu(add_idx, slot, slot_val)
+    local pm = AshitaCore and AshitaCore:GetPacketManager()
+    if not pm then return false end
+    local p = {}
+    for i = 1, 0xA4 do p[i] = 0 end
+    p[1], p[2] = 0x02, 0x53                       -- id 0x102, size 0xA4
+    p[0x04 + 1] = add_idx or 0
+    p[0x08 + 1] = BLU_JOB_ID
+    if slot then p[0x0C + slot] = slot_val end    -- slot 1..20 -> byte 0x0C + slot - 1
+    return pcall(function() pm:AddOutgoingPacket(0x102, p) end)
+end
+
+local function IsSet(idx)
+    for slot = 1, BLU_SLOTS do if AP.current[slot] == idx then return slot end end
+    return nil
+end
+
+local function FirstEmpty()
+    for slot = 1, BLU_SLOTS do if (AP.current[slot] or 0) == 0 then return slot end end
+    return nil
+end
+
+local function Finish(msg, col)
+    AP.running = false
+    local parts = {}
+    if msg then
+        parts[#parts + 1] = msg
+    else
+        parts[#parts + 1] = (AP.added + AP.removed == 0) and 'Set-up already active.'
+            or ('Set-up applied: %d set, %d removed.'):format(AP.added, AP.removed)
+    end
+    local fails = {}
+    for idx, why in pairs(AP.failed) do fails[#fails + 1] = ('%s (%s)'):format(IdxName(idx), why) end
+    table.sort(fails)
+    for _, s in ipairs(AP.skipped) do fails[#fails + 1] = s end
+    if #fails > 0 and not msg then
+        parts[#parts + 1] = 'Not set: ' .. table.concat(fails, ', ')
+        col = col or COL_WARN
+    end
+    local text = table.concat(parts, '  ')
+    AP.status = { text = text, col = col or COL_GOOD }
+    print('[BluTracker] ' .. text)
+end
+
+local function StartApply()
+    local lvl, which = BlueJobLevel()
+    if not lvl then
+        AP.status = { text = 'Change to BLU (main or support job) to apply.', col = COL_BAD }
+        return
+    end
+    local targets, skipped, seen_idx = {}, {}, {}
+    for _, id in ipairs(DesignIds()) do
+        local s = SHEET_BY_ID[id]
+        if s and s.idx and not seen_idx[s.idx] then
+            seen_idx[s.idx] = true
+            if s.lvl > lvl then
+                skipped[#skipped + 1] = ('%s (Lv%d)'):format(s.name, s.lvl)
+            elseif spellbook_ok and learned and s.rec and not learned[s.rec.key] then
+                skipped[#skipped + 1] = s.name .. ' (not learned)'
+            else
+                targets[#targets + 1] = { idx = s.idx, name = s.name }
+            end
+        elseif s and not s.idx then
+            skipped[#skipped + 1] = s.name .. ' (unknown spell id)'
+        end
+    end
+    if #targets == 0 then
+        AP.status = { text = (#skipped > 0) and ('Nothing to set: ' .. table.concat(skipped, ', '))
+            or 'Your set-up is empty.', col = COL_WARN }
+        return
+    end
+    AP.running  = true
+    AP.targets  = targets
+    AP.want     = seen_idx
+    AP.skipped  = skipped
+    AP.failed   = {}
+    AP.rm_fail  = {}
+    AP.added, AP.removed = 0, 0
+    AP.last     = nil
+    AP.waiting  = false
+    AP.timeouts = 0
+    AP.next_at  = 0
+    AP.need_refresh = true   -- always start from the server's view of the slots
+    AP.status   = { text = 'Applying...', col = COL_TIER }
+end
+
+local function CancelApply()
+    if AP.running then Finish('Apply cancelled.', COL_WARN) end
+end
+
+-- ---- Load Current Set ----
+-- Replace the designer with the spells set in game (slots from 0x044).
+-- Every set spell is loaded (trait and no-trait alike).
+local function LoadCurrentSet(cur)
+    local d = Design()
+    for k in pairs(d) do d[k] = nil end
+    for slot = 1, BLU_SLOTS do
+        local id = IdOfIdx(cur[slot] or 0)
+        if id then d[id] = true end
+    end
+    cfg.bluemage_trait_loaded = nil
+    settings.save()
+    AP.status = nil          -- no message: the designer itself shows the result
+end
+
+-- Ask the server for a fresh copy of the set spells (all-zero 0x102 ->
+-- 0x044 reply), then load them; falls back to the last copy seen.
+local function LoadCurrentSetClicked()
+    if AP.running then
+        AP.status = { text = 'Wait for Apply to finish first.', col = COL_WARN }
+        return
+    end
+    if not BlueJobLevel() then
+        AP.status = { text = 'Change to BLU (main or support job) to read your set.', col = COL_BAD }
+        return
+    end
+    if SendBlu(0, nil, nil) then
+        AP.show_until = os.clock() + REPLY_WAIT
+        AP.status = nil
+    elseif AP.current then
+        LoadCurrentSet(AP.current)
+    else
+        AP.status = { text = 'Could not read your set spells.', col = COL_BAD }
+    end
+end
+
+-- 0x044: current set spells (main or support BLU).
+function M._trt_packet(e)
+    local data = e.data
+    if type(data) ~= 'string' or #data < 0x1C then return end
+    if data:byte(0x04 + 1) ~= BLU_JOB_ID then return end
+    local cur = {}
+    for slot = 1, BLU_SLOTS do cur[slot] = data:byte(0x08 + slot) or 0 end
+    AP.current = cur
+    if AP.show_until then
+        AP.show_until = nil
+        LoadCurrentSet(cur)
+    end
+    if AP.waiting then
+        AP.waiting = false
+        AP.timeouts = 0
+        AP.next_at = os.clock() + SET_SPEED
+    end
+end
+
+-- One step per server reply, called every frame from M.render.
+function M._trt_tick()
+    local now = os.clock()
+    if AP.show_until and now > AP.show_until then   -- no reply to Show Current Set
+        AP.show_until = nil
+        if AP.current then LoadCurrentSet(AP.current)
+        else AP.status = { text = 'No reply from the server - could not read your set.', col = COL_BAD } end
+    end
+    if not AP.running then return end
+    if AP.waiting then
+        if now < AP.wait_until then return end
+        AP.waiting = false                         -- no 0x044 in time
+        AP.timeouts = AP.timeouts + 1
+        if AP.timeouts >= 2 or not AP.current then
+            Finish('No reply from the server - stopped. Try again out of combat / after zoning.', COL_BAD)
+            return
+        end
+        if AP.last and AP.last.kind == 'add' then AP.failed[AP.last.idx] = 'no reply' end
+        AP.last = nil
+        AP.next_at = now
+    end
+    if now < AP.next_at then return end
+    if not BlueJobLevel() then Finish('No longer on BLU - stopped.', COL_BAD); return end
+
+    local function send(add_idx, slot, val, last)
+        if not SendBlu(add_idx, slot, val) then
+            Finish('Could not send the spell-change packet.', COL_BAD)
+            return
+        end
+        AP.last, AP.waiting, AP.wait_until = last, true, now + REPLY_WAIT
+    end
+
+    if AP.need_refresh then
+        AP.need_refresh = false
+        send(0, nil, nil, nil)
+        return
+    end
+    if not AP.current then Finish('Could not read your set spells.', COL_BAD); return end
+
+    -- Check how the last change went.
+    local L = AP.last
+    AP.last = nil
+    if L then
+        if L.kind == 'add' then
+            if IsSet(L.idx) then AP.added = AP.added + 1
+            else AP.failed[L.idx] = 'refused - points, slots or level?' end
+        else
+            if IsSet(L.idx) then AP.rm_fail[L.idx] = true
+            else AP.removed = AP.removed + 1 end
+        end
+    end
+
+    -- 1) Remove set spells that aren't part of this set-up.
+    for slot = 1, BLU_SLOTS do
+        local v = AP.current[slot] or 0
+        if v ~= 0 and not AP.want[v] and not AP.rm_fail[v] then
+            send(0, slot, v, { kind = 'remove', idx = v })
+            AP.status = { text = ('Removing %s...'):format(IdxName(v)), col = COL_TIER }
+            return
+        end
+    end
+    -- 2) Set the missing set-up spells.
+    for _, t in ipairs(AP.targets) do
+        if not IsSet(t.idx) and not AP.failed[t.idx] then
+            local slot = FirstEmpty()
+            if not slot then
+                AP.failed[t.idx] = 'no free slot'
+            else
+                send(t.idx, slot, t.idx, { kind = 'add', idx = t.idx })
+                AP.status = { text = ('Setting %s...'):format(t.name), col = COL_TIER }
+                return
+            end
+        end
+    end
+    Finish()
+end
+
+-- Is the designer's set-up exactly what's set in game?
+local function ActiveInGame()
+    if not AP.current then return nil end
+    local want = {}
+    for _, id in ipairs(DesignIds()) do
+        local s = SHEET_BY_ID[id]
+        if s and s.idx then want[s.idx] = true end
+    end
+    local have = {}
+    for slot = 1, BLU_SLOTS do
+        local v = AP.current[slot] or 0
+        if v ~= 0 then
+            if not want[v] then return false end
+            have[v] = true
+        end
+    end
+    for idx in pairs(want) do if not have[idx] then return false end end
+    return true
+end
+
+-- ---- Save / Load popups ----
+-- Small floating windows (not modal popups: those dim the screen and take
+-- all input, which locks the game's chat log while they're open).
+local WIN_SAVE = 'Save Set-up##trt_win_save'
+local WIN_LOAD = 'Load Set-up##trt_win_load'
+local WIN = { save = false, load = false, focus = nil }
+local save_buf  = { '' }
+local load_sel  = nil      -- index into SavedSets()
+local del_armed = nil      -- index awaiting a second Delete click
+local pop_pos   = nil      -- where the popups open (under the buttons)
+
+-- Run fn(); on a Lua error, report it once in chat instead of letting it
+-- escape mid-frame (an escaped error skips the matching End*/Pop* calls and
+-- leaves the whole window's ImGui stack unbalanced).
+local reported = {}
+local function Guard(where, fn)
+    local ok, err = pcall(fn)
+    if not ok then
+        local msg = tostring(err)
+        if not reported[msg] then
+            reported[msg] = true
+            print(('[BluTracker] %s error: %s'):format(where, msg))
+        end
+    end
+    return ok
+end
+
+-- Draw one floating window (themed like the main window) if it's open.
+-- Begin/End and the theme are always paired; the body runs guarded.
+local function FloatWindow(key, title, body)
+    if not WIN[key] then return end
+    if pop_pos then imgui.SetNextWindowPos(pop_pos, ImGuiCond_Appearing or 2) end
+    if WIN.focus == key then
+        WIN.focus = nil
+        if imgui.SetNextWindowFocus then pcall(imgui.SetNextWindowFocus) end
+    end
+    local open  = { true }
+    local flags = bit.bor(ImGuiWindowFlags_AlwaysAutoResize or 0, ImGuiWindowFlags_NoSavedSettings or 0,
+        ImGuiWindowFlags_NoCollapse or 0)
+    PushWindowTheme(BgColor())
+    if imgui.Begin(title, open, flags) then
+        if not Guard(title:gsub('##.*', '') .. ' window', body) then WIN[key] = false end
+    end
+    imgui.End()
+    PopWindowTheme()
+    if not open[1] then WIN[key] = false end
+end
+
+local function SavePopupBody()
+    local K = UIK
+    TextC(COL_SUBHEAD, 'Name this set-up:')
+    if imgui.IsWindowAppearing and imgui.IsWindowAppearing() then
+        pcall(function() imgui.SetKeyboardFocusHere(0) end)
+    end
+    imgui.SetNextItemWidth(220)
+    local enter = imgui.InputText('##trt_save_name', save_buf, SET_NAME_MAX + 1,
+        ImGuiInputTextFlags_EnterReturnsTrue or 0)
+    local name = (save_buf[1] or ''):gsub('^%s+', ''):gsub('%s+$', '')
+    if #name > SET_NAME_MAX then name = name:sub(1, SET_NAME_MAX) end
+    local exists = (name ~= '') and FindSet(name) ~= nil
+    local nids = #DesignIds()
+    if exists then
+        TextC(COL_WARN, 'A set-up with this name exists - it will be replaced.')
+    else
+        TextC(COL_DIM, ('%d spell%s in the set-up.'):format(nids, nids == 1 and '' or 's'))
+    end
+    local ok = K.button(exists and 'Replace##trt_sv' or 'Save##trt_sv', 104) or enter
+    imgui.SameLine(0, 8)
+    local cancel = K.button('Cancel##trt_sv', 104)
+    if ok and name ~= '' then
+        SaveSetup(name)
+        WIN.save = false
+    elseif cancel then
+        WIN.save = false
+    end
+end
+
+
+local LOAD_W, DEL_W = 300, 58
+
+-- One row per saved set-up: name (click to select, double-click to load)
+-- and its own Delete button (click twice: Delete -> Sure?).
+local function LoadListRows(sets, act)
+    for i, e in ipairs(sets) do
+        imgui.TableNextRow()
+        imgui.TableSetColumnIndex(0)
+        local n, cost = #(e.ids or {}), 0
+        for _, id in ipairs(e.ids or {}) do
+            local s = SHEET_BY_ID[id]; if s then cost = cost + s.cost end
+        end
+        local cur = (e.name == cfg.bluemage_trait_loaded)
+        imgui.AlignTextToFramePadding()
+        imgui.PushStyleColor(ImGuiCol_Text, cur and COL_GOOD or COL_TEXT)
+        local clicked = imgui.Selectable(('%s  (%d, %d pts)##trt_ld_%d'):format(tostring(e.name), n, cost, i),
+            load_sel == i)
+        imgui.PopStyleColor(1)
+        if clicked then
+            if load_sel ~= i then del_armed = nil end
+            load_sel = i
+        end
+        if imgui.IsItemHovered() then
+            if imgui.IsMouseDoubleClicked and imgui.IsMouseDoubleClicked(0) then act.load = i end
+            local names = {}
+            for _, id in ipairs(e.ids or {}) do
+                local s = SHEET_BY_ID[id]; names[#names + 1] = s and s.name or id
+            end
+            imgui.SetTooltip((n > 0 and table.concat(names, '\n') or '(empty)')
+                .. ('\n\n%d spells, %d set points. Double-click to load.'):format(n, cost))
+        end
+
+        imgui.TableSetColumnIndex(1)
+        local armed = (del_armed == i)
+        if armed then imgui.PushStyleColor(ImGuiCol_Text, COL_BAD) end
+        local del = UIK.button((armed and 'Sure?' or 'Delete') .. '##trt_del_' .. i, DEL_W)
+        if armed then imgui.PopStyleColor(1) end
+        UIK.tip(armed and 'Click again to delete this set-up.' or 'Delete this saved set-up.')
+        if del then
+            if armed then act.delete = i else del_armed = i end
+        end
+    end
+end
+
+local function LoadPopupBody()
+    local K = UIK
+    local sets = SavedSets()
+    if load_sel and not sets[load_sel] then load_sel = nil end
+    local act = {}
+    if #sets == 0 then
+        TextC(COL_DIM, 'No saved set-ups yet - use Save first.')
+    else
+        TextC(COL_SUBHEAD, 'Saved set-ups:')
+        local rowh = 26
+        pcall(function()
+            local h = imgui.GetFrameHeightWithSpacing and imgui.GetFrameHeightWithSpacing()
+            if type(h) == 'number' and h > 0 then rowh = h + 2 end
+        end)
+        local listh = math.min(240, 12 + #sets * rowh)
+        imgui.PushStyleColor(ImGuiCol_ChildBg, { 0.08, 0.09, 0.13, 1.00 })
+        imgui.BeginChild('##trt_load_list', { LOAD_W, listh })
+        imgui.PopStyleColor(1)
+        Guard('Load list', function()
+            if imgui.BeginTable('##trt_load_tbl', 2, ImGuiTableFlags_SizingFixedFit or 0, { LOAD_W - 16, 0 }) then
+                imgui.TableSetupColumn('name', ImGuiTableColumnFlags_WidthStretch or 0)
+                imgui.TableSetupColumn('del',  ImGuiTableColumnFlags_WidthFixed or 0, DEL_W)
+                Guard('Load list', function() LoadListRows(sets, act) end)
+                imgui.EndTable()
+            end
+        end)
+        imgui.EndChild()
+    end
+    local has = load_sel ~= nil
+    if K.button('Load##trt_ld', 96) and has then act.load = load_sel end
+    K.tip(has and 'Load the selected set-up into Your Set-up.' or 'Select a set-up first.')
+    imgui.SameLine(0, 8)
+    if K.button('Close##trt_ld', 96) then del_armed = nil; WIN.load = false end
+
+    if act.delete and sets[act.delete] then
+        DeleteSetup(act.delete)
+        load_sel, del_armed = nil, nil
+    elseif act.load and sets[act.load] then
+        LoadSetup(sets[act.load])
+        del_armed = nil
+        WIN.load = false
+    end
+end
+
+-- Drawn from M.render after the main window (they're separate windows).
+function M._trt_windows()
+    FloatWindow('save', WIN_SAVE, SavePopupBody)
+    FloatWindow('load', WIN_LOAD, LoadPopupBody)
+end
+
+-- Save / Load / Apply row, its status line and the two popups.
+local function RenderSetupButtons(used, budget)
+    local K = UIK
+    local gap = 6
+    local bw = math.floor((K.inner_width() - 2 * gap) / 3)
+    local open_save, open_load = false, false
+    if K.button('Save##trt_btn', bw) then open_save = true end
+    K.tip('Save the set-up above under a name.')
+    imgui.SameLine(0, gap)
+    if K.button('Load##trt_btn', bw) then open_load = true end
+    K.tip('Pick a saved set-up to load (or delete).')
+    imgui.SameLine(0, gap)
+    if AP.running then
+        imgui.PushStyleColor(ImGuiCol_Text, COL_WARN)
+        if K.button('Cancel##trt_btn', bw) then CancelApply() end
+        imgui.PopStyleColor(1)
+        K.tip('Stop applying (spells already changed stay changed).')
+    else
+        if K.button('Apply##trt_btn', bw) then StartApply() end
+        K.tip('Equip Currently Selected Spells')
+    end
+    -- The Save / Load windows open just under the buttons.
+    pcall(function()
+        local x0 = imgui.GetItemRectMin()
+        local _, y1 = imgui.GetItemRectMax()
+        local cx = imgui.GetCursorScreenPos()
+        if type(cx) == 'number' and type(y1) == 'number' then pop_pos = { cx, y1 + 6 } end
+        local _ = x0
+    end)
+    if open_save then
+        save_buf[1] = cfg.bluemage_trait_loaded or ''
+        WIN.save, WIN.load, WIN.focus = true, false, 'save'
+    end
+    if open_load then
+        load_sel, del_armed = nil, nil
+        local i = FindSet(cfg.bluemage_trait_loaded)
+        if i then load_sel = i end
+        WIN.load, WIN.save, WIN.focus = true, false, 'load'
+    end
+
+    -- Which saved set-up is loaded, and whether it's active in game.
+    local ids = DesignIds()
+    -- A finished Apply's message goes away once the set-up is changed.
+    local sig = table.concat(ids, ',')
+    if AP.status and not AP.running then
+        if AP.status.sig == nil then AP.status.sig = sig
+        elseif AP.status.sig ~= sig then AP.status = nil end
+    end
+    local lname = cfg.bluemage_trait_loaded
+    if lname then
+        local _, e = FindSet(lname)
+        local mod = e and not MatchesSaved(e, ids)
+        TextC(COL_DIM, ('Loaded: %s%s'):format(lname, mod and '  (modified)' or ''))
+    end
+    if AP.status then
+        TextC(AP.status.col or COL_DIM, AP.status.text)
+    elseif #ids > 0 then
+        local act = ActiveInGame()
+        if act == true then TextC(COL_GOOD, 'Active in game.')
+        elseif act == false then TextC(COL_DIM, 'Not applied yet.') end
+    end
+end
+
 local function RenderTraitDesigner(myLvl, used, count, per, chosen, pw)
     local K, UI = UIK, UIK.UI
     local budget = MaxBluePoints()
-    local other  = cfg.bluemage_trait_other or 0
-    local total  = used + other
+    local total  = used
     local left   = budget - total
 
     -- ---- Points ----
     K.section_begin('trt_setup', 'Your Set-up', pw)
-    TextC(total > budget and COL_BAD or COL_GOOD, ('Set points: %d / %d'):format(total, budget))
-    K.note(('%d left'):format(math.max(0, left)))
-    if other > 0 then K.note(('%d from trait spells + %d reserved'):format(used, other)) end
+    TextC(total > budget and COL_BAD or COL_GOOD,
+        ('Set points: %d / %d - %d Left'):format(total, budget, math.max(0, left)))
     if total > budget then TextC(COL_BAD, ('Over by %d point%s'):format(-left, -left == 1 and '' or 's')) end
+    RenderSetupButtons(used, budget)
     K.section_end()
 
     -- ---- Traits gained ----
@@ -3750,14 +4606,16 @@ local function RenderTraitDesigner(myLvl, used, count, per, chosen, pw)
             local s = c.s
             local warn = nil
             if myLvl and s.lvl > myLvl then warn = 'above your level'
-            elseif not (s.rec and learned and learned[s.rec.key]) then warn = 'not learned' end
+            elseif s.rec and not (learned and learned[s.rec.key]) then warn = 'not learned' end
             imgui.PushStyleColor(ImGuiCol_Text, warn and COL_WARN or COL_TEXT)
             if imgui.Selectable(('%2d  %s%s##trtdes_%d'):format(s.cost, s.name, warn and ('  (' .. warn .. ')') or '', i), false) then
                 Design()[s.id] = nil; settings.save()
             end
             imgui.PopStyleColor(1)
             if imgui.IsItemHovered() then
-                imgui.SetTooltip(c.t.name .. ('  -  %d trait pts\nClick to remove.'):format(s.pts))
+                local isL = s.rec and learned and learned[s.rec.key]
+                SpellTooltip(s, warn and ('Warning: ' .. warn) or nil, isL,
+                    (c.t and ('%s: %d trait pts'):format(c.t.name, s.pts) or 'No job trait') .. '   (click to remove)')
             end
         end
         K.block_end()
@@ -3791,6 +4649,10 @@ local function RenderTraitsTab()
             cfg.bluemage_trait_manual = v
             if v then cfg.bluemage_trait_points = math.min(maxpts, ManualMaxPoints()) end   -- start from the auto value
         end, 'On: type your own maximum instead of using your BLU level.')
+        imgui.SameLine(0, 14)
+        if K.button('Load Current Set##trt') then LoadCurrentSetClicked() end
+        K.tip('Load the Blue Magic spells you have set right now into Your Set-up (BLU main or support job). '
+            .. 'Every set spell is loaded, including ones with no job trait.')
 
         local nLearned = learnedCount or CountLearned()
         if cfg.bluemage_trait_manual then
@@ -3808,10 +4670,6 @@ local function RenderTraitsTab()
             K.text(UI.dim, ('+0  (%d / %d spells learned)'):format(nLearned, ASSIM_SPELLS))
         end
 
-        K.row('Reserved', 'Points set aside for spells you\'ll set anyway (nukes, cures, etc. that aren\'t part of a trait).')
-        K.slider('int', '##trt_reserved', cfg.bluemage_trait_other or 0, 0, 80, '%d pts', 0,
-            function(v) cfg.bluemage_trait_other = v end)
-
         K.row('Filters', 'Narrow the Trait Sets list. Hover each box for details.')
         K.check('Only learned##trt', cfg.bluemage_trait_only_learned, function(v)
             cfg.bluemage_trait_only_learned = v
@@ -3825,6 +4683,13 @@ local function RenderTraitsTab()
         K.check('Can Combo##trt', cfg.bluemage_trait_can_combo, function(v)
             cfg.bluemage_trait_can_combo = v
         end, 'Only show traits you can actually unlock with the spells allowed by the other filters, and only the spells that are part of a valid combination.')
+
+        -- Magic / Physical / Ranged: filter the Trait Sets and No Traits lists.
+        -- Spell type row: Element dropdown first, then Magic / Physical / Ranged.
+        K.row('Spell type')
+        RenderElementFilter(ElementComboWidth())
+        imgui.SameLine(0, 14)
+        RenderTypeFilters()
         imgui.EndTable()
     end
     K.section_end()
@@ -3841,10 +4706,31 @@ local function RenderTraitsTab()
     local dw = 280
     local lw = math.max(200, aw - dw - 8)
 
-    imgui.BeginChild('##bm_traits_ref', { lw, ah })
+    -- Left column: search box (card width), then the scrolling
+    -- Trait Sets + No Traits.
+    imgui.BeginGroup()
+    local y0 = nil
+    pcall(function() local y = imgui.GetCursorPosY(); if type(y) == 'number' then y0 = y end end)
+    RenderSpellSearch(lw)
+    local used_h = nil
+    pcall(function()
+        local y = imgui.GetCursorPosY()
+        if y0 and type(y) == 'number' and y > y0 then used_h = y - y0 end
+    end)
+    if not used_h then
+        local sh = 26
+        pcall(function()
+            local h = imgui.GetFrameHeightWithSpacing()
+            if type(h) == 'number' and h > 0 then sh = h end
+        end)
+        used_h = 3 * sh
+    end
+    imgui.BeginChild('##bm_traits_ref', { lw, math.max(60, ah - used_h) })
     RenderTraitReference(myLvl, learnedCount, per, K.panel_width())
+    RenderNoTraits(myLvl, K.panel_width())
     imgui.Dummy({ 0, 4 })
     imgui.EndChild()
+    imgui.EndGroup()
     imgui.SameLine(0, 8)
     imgui.BeginChild('##bm_traits_design', { 0, ah })
     RenderTraitDesigner(myLvl, used, count, per, chosen, K.panel_width())
@@ -4196,6 +5082,9 @@ function M.render()
     -- Persist "seen" counts every so often (not on every chat line).
     FlushSeen(false)
 
+    -- Traits tab: step an in-progress "Apply" (one spell change per reply).
+    if M._trt_tick then pcall(M._trt_tick) end
+
     -- Keep the learned checkmarks in sync with the player's spellbook. Runs
     -- regardless of which windows are open.
     if spellbook_ok then
@@ -4249,6 +5138,8 @@ function M.render()
     -- config" (Settings), or the first draw after loading (last tab).
     local want_tab = vt and vt._want_tab or nil
     if vt and vt._want_settings_tab then want_tab = 'Settings' end
+    if cfg.bluemage_last_tab == 'Traits' then cfg.bluemage_last_tab = 'Presets' end   -- tab renamed
+    if want_tab == 'Traits' then want_tab = 'Presets' end
     if vt and not vt._tab_restored then
         vt._tab_restored = true
         want_tab = want_tab or cfg.bluemage_last_tab
@@ -4302,6 +5193,15 @@ function M.render()
         local hl = { cfg.bluemage_hide_learned or false }
         if imgui.Checkbox('Hide learned', hl) then
             cfg.bluemage_hide_learned = hl[1]; settings.save()
+        end
+        imgui.SameLine(0, 10)
+        local sk = { cfg.bluemage_only_my_skill or false }
+        if imgui.Checkbox('<= Skill level', sk) then
+            cfg.bluemage_only_my_skill = sk[1]; settings.save()
+        end
+        if imgui.IsItemHovered() then
+            imgui.SetTooltip((bluLvl and skill) and ('Only show spells your Blue Magic skill (%d) can learn.'):format(skill)
+                or 'Only show spells your Blue Magic skill can learn (needs BLU as main job).')
         end
         imgui.SameLine(0, 10)
         local ol = { cfg.bluemage_only_my_level or false }
@@ -4379,7 +5279,7 @@ function M.render()
         SetupColumns('##bm_rows')
         local shown = 0
         for _, r in ipairs(SORTED) do
-            if PassesFilter(r, needle, bluLvl) then
+            if PassesFilter(r, needle, bluLvl, skill) then
                 DrawSpellRow(r, bluLvl, skill)
                 shown = shown + 1
             end
@@ -4436,8 +5336,8 @@ function M.render()
         imgui.EndTabItem()
     end
 
-    -- Traits tab: job-trait combinations + set-up designer.
-    if UIK.tab_item('##blu_main_tabs', 'Traits', TabFlags('Traits')) then
+    -- Presets tab (was "Traits"): job-trait combinations + set-up designer.
+    if UIK.tab_item('##blu_main_tabs', 'Presets', TabFlags('Presets')) then
         RenderTraitsTab()
         imgui.EndTabItem()
     end
@@ -4487,6 +5387,9 @@ function M.render()
     imgui.End()
 
     PopWindowTheme()
+
+    -- Traits tab's Save / Load windows (separate, non-modal).
+    if M._trt_windows then pcall(M._trt_windows) end
 
     -- Sync close-button click back to cfg.
     if visible[1] ~= cfg.bluemage_open then
@@ -4691,6 +5594,7 @@ function M.reset_settings(default_config)
     cfg.bluemage_auto_learn    = default_config.bluemage_auto_learn
     cfg.bluemage_hide_learned  = default_config.bluemage_hide_learned
     cfg.bluemage_only_my_level = default_config.bluemage_only_my_level
+    cfg.bluemage_only_my_skill = default_config.bluemage_only_my_skill
     cfg.bluemage_map_scale       = default_config.bluemage_map_scale
     cfg.bluemage_show_player     = default_config.bluemage_show_player
     cfg.bluemage_track_mode    = default_config.bluemage_track_mode

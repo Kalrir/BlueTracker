@@ -24,7 +24,7 @@
 
 addon.name    = 'BluTracker';
 addon.author  = 'Kalrir';
-addon.version = '1.20';
+addon.version = '1.41';
 addon.desc    = 'Blue Magic spell-learning tracker with a where-to-learn guide.';
 
 require('common');
@@ -49,6 +49,7 @@ local default_config = T{
     bluemage_auto_learn    = true,   -- chat fallback when the spellbook read is unavailable
     bluemage_hide_learned  = false,  -- filter: hide already-learned spells
     bluemage_only_my_level = false,  -- filter: only spells at/below your BLU level
+    bluemage_only_my_skill = false,  -- filter: only spells your Blue Magic skill can learn
     -- Mini-map / zone-map options
     bluemage_map_scale       = 1.0,   -- size multiplier for the hover mini-maps
     bluemage_show_player     = true,  -- draw a marker at the player's live position
@@ -68,11 +69,12 @@ local default_config = T{
     bluemage_trait_manual       = false,  -- false = max points from your BLU level
     bluemage_trait_points       = 45,     -- manual max set points (when manual)
     bluemage_trait_last_level   = 75,     -- last BLU level seen (used when not on BLU)
-    bluemage_trait_other        = 0,      -- points reserved for non-trait spells
     bluemage_trait_only_learned = false,
     bluemage_trait_only_level   = false,
     bluemage_trait_can_combo    = false,
     bluemage_trait_design       = T{},    -- sheet spell id -> true (selected)
+    bluemage_trait_sets         = T{},    -- saved set-ups: { name, ids = { spell id, ... } }
+    bluemage_trait_loaded       = nil,    -- name of the set-up last saved/loaded
 
     -- "Action Learned!" splash (BlueLearn). Colors are ARGB (0xAARRGGBB).
     bluelearn_enabled       = true,
@@ -230,6 +232,9 @@ ashita.events.register('packet_in', 'packet_in_cb', function(e)
     elseif e.id == 0x028 then
         -- Action packet: tells the "seen" counter exactly which monster used
         -- a TP move, so same-named mobs claimed by outsiders aren't counted.
+        pcall(BlueMage.packet_in, e);
+    elseif e.id == 0x044 then
+        -- Job extra data: the Blue Magic spells currently set (Traits tab Apply).
         pcall(BlueMage.packet_in, e);
     end
 end);

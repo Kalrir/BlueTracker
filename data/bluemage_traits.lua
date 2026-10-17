@@ -37,7 +37,6 @@ M.TRAITS = {
       } },
     { name = 'Auto Refresh', need = 8, max = 1,
       rule = 'Auto Refresh points must add up to at least 8 (set cost doesn\'t matter).',
-      note = 'Geist Wall (4) and Blood Saber (4) are bugged high: expected to drop to 1 and 2.',
       spells = {
         { 44, 'Stinking Gas',       2, 1 },
         { 46, 'Geist Wall',         3, 4 },
@@ -110,7 +109,6 @@ M.TRAITS = {
         { 61, 'Eyes On Me',    4, 4 },
         { 62, 'Memento Mori',  4, 4 },
         { 71, 'Heat Breath',   4, 4 },
-        { 74, 'Magic Hammer',  4, 4 },
       } },
     { name = 'Magic Defense Bonus', need = 8,
       rule = 'Any 2 spells. Every 2 more spells adds a tier.',

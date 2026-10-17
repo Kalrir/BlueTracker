@@ -140,7 +140,7 @@ M.LIST = {
     { 73, 'Ram Charge',         'Phys', 'Blunt',    'Damage',   'Lizard Killer',       'Fragmentation',        'Beasts',   nil },
     { 73, 'Temporal Shift',     'Mag',  'Thunder',  'Damage',   'Attack Bonus',        'Thunder dmg (Stun)',   '—',        nil },
     { 74, 'Actinic Burst',      'Mag',  'Light',    'Enfeeble', 'Auto Refresh',        'AoE Flash',            '—',        nil },
-    { 74, 'Magic Hammer',       'Mag',  'Light',    'Damage',   'None',                'Light dmg (MP drain)', 'Beastmen', nil, true },
+    { 74, 'Magic Hammer',       'Mag',  'Light',    'Damage',   'None',                'Light dmg (MP drain)', 'Beastmen', 30,  true },
     { 74, 'Reactor Cool',       'Mag',  'Ice',      'Enfeeble', 'Magic Defense Bonus', 'None',                 '—',        nil, true },
     { 75, 'Exuviation',         'Mag',  'Fire',     'Heal',     'Resist Sleep',        'Cure + remove ail.',   '—',        nil },
     { 75, 'Plasma Charge',      'Mag',  'Thunder',  'Damage',   'Auto Refresh',        'Thunder dmg',          'Arcana',   nil },
