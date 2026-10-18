@@ -2,7 +2,7 @@
 
 Blue Magic tracker addon for **Ashita v4 / HorizonXI** (75-era, LSB server).
 Install path: `<Ashita>/addons/blutracker/` — load with `/addon load blutracker`.
-Current version: **1.44** (Presets tab: Save / Load / Apply, search, No Traits).
+Current version: **1.47** (Presets tab: Save / Load / Apply, search, No Traits).
 
 > Keep this file up to date after every change and re-upload it to the
 > "FFXI BlueTracker" project.
@@ -50,7 +50,8 @@ Current version: **1.44** (Presets tab: Save / Load / Apply, search, No Traits).
   - `load` → `BlueMage.init(host)`
   - `command` → `BlueMage.command`
   - `text_in` → `BlueMage.text_in`
-  - `packet_in`: `0x00A` reload settings + re-init; `0x00B` save; `0x028` → seen counter;
+  - `packet_in`: `0x00A` sets `reinit_pending` (settings reload + `BlueMage.init` run on the
+    next `d3d_present`, not inside the packet callback); `0x00B` save; `0x028` → seen counter;
     **`0x044` → `BlueMage.packet_in` (current set Blue Magic spells, for Apply)**
   - `d3d_present` → `BlueMage.render`
 
@@ -80,6 +81,19 @@ Current version: **1.44** (Presets tab: Save / Load / Apply, search, No Traits).
 > The main chunk is near Lua's 200-local limit — new features go inside a
 > closure (like the Traits/Counter tabs) or hang off `M`.
 
+### Crash-safety rules (1.45)
+
+- **Nothing that reads game memory runs inside `packet_in`.** Packet callbacks only copy
+  bytes: 0x028 data goes to `M._act_q` (max 64), drained by `M._drain_actions()` →
+  `M._handle_action(data)` from `M.render`; 0x044 slot bytes go to `AP.pending`, handled at
+  the top of `M._trt_tick()`. A native fault (EXCEPTION_ACCESS_VIOLATION) can't be caught by
+  `pcall` and unloads the addon.
+- **Entity indexes must be 1..0x8FF.** The client entity array has 2304 slots and Ashita does
+  not bounds-check `ent:GetServerId/GetName/GetClaimStatus(i)`. `IndexOfServerId` and the
+  `packets_working` probe only try `serverId % 0x1000` when it is < 0x900.
+- No `GetResourceManager():GetSpellById` call for spell indexes from 0x044 (`IdOfIdx` names
+  unknown spells via `IdxName` → "spell #N").
+
 ### Ashita ImGui binding gotchas
 
 - `imgui.BeginChild(id, size)` — the 3rd arg is **child flags (number)**, not a
@@ -90,7 +104,11 @@ Current version: **1.44** (Presets tab: Save / Load / Apply, search, No Traits).
 
 ### Presets tab (inside `RenderTraitsTab` closure; internal names still say "trait")
 
-- `TRAITS` — trait sheet resolved to DB records; each spell `s = { lvl, name, cost, pts, rec, id, idx }`
+- `TRAITS` — trait sheet resolved to DB records (sheet rows with no DB spell are skipped, so
+  the Presets tab lists exactly the 106 server spells: 92 on Trait Sets + 14 No Traits);
+  `t.unreachable` = the trait's spells together have fewer trait points than `need` (Counter,
+  Resist Gravity, Resist Slow: 4 / 8) — shown with an orange "Only X / Y trait points from these
+  spells." line and never hidden by the Can Combo filter; each spell `s = { lvl, name, cost, pts, rec, id, idx }`
   (`s.id` = sheet key, `s.idx` = spell id − 0x200).
 - `ALL_BY_ID` / `EXTRAS` — every spell the designer can hold: sheet entries + every other DB
   spell (no job trait, `extra = true`, `pts = 0`, cost from `BP`). `IdOfIdx(idx)` (in the
@@ -115,7 +133,8 @@ Current version: **1.44** (Presets tab: Save / Load / Apply, search, No Traits).
     `elem == 'Ranged'`).
   - `RenderElementFilter(w)` — "Element: X" combo, **first item on the "Spell type" row**
     (width from `ElementComboWidth()` = longest label + arrow) (`TRT_ELEMENTS`: None +
-    Fire/Ice/Wind/Earth/Thunder/Water/Light/Dark; None = no element filter). Session-only state. `KindHit(s)` applies them; `FiltersActive(needle)`
+    Fire/Ice/Wind/Earth/Thunder/Water/Light/Dark + Slashing/Piercing/Blunt (physical damage types,
+    matched on `rec.elem`); None = no element filter). Session-only state. `KindHit(s)` applies them; `FiltersActive(needle)`
     = search or any of these in use.
   - Expand state while filtering: matching traits start **collapsed**; clicking a header opens
     it (`filter_open[name]`). `FilterSig(needle)` — when the search/element/type combination
@@ -140,7 +159,9 @@ Current version: **1.44** (Presets tab: Save / Load / Apply, search, No Traits).
     `SaveSetup(name)`, `LoadSetup(entry)` (replaces designer), `DeleteSetup(i)`, `MatchesSaved`.
   - Applier state `AP` (`current` = slot 1..20 → spell idx from 0x044, `running`, `status`).
   - `StartApply()` — needs BLU main or sub; skips spells above level / not learned.
-  - `M._trt_packet(e)` — parses 0x044 (byte 0x04 = job 16; bytes 0x08..0x1B = 20 slots).
+  - `M._trt_packet(e)` — parses 0x044 (byte 0x04 = job 16; bytes 0x08..0x1B = 20 slots) into
+    `AP.pending` only; `M._trt_tick()` applies it (sets `AP.current`, runs a pending Load
+    Current Set, releases the Apply wait).
   - `M._trt_tick()` — one change per server reply, `SET_SPEED` 0.65 s after each 0x044,
     `REPLY_WAIT` 2.5 s timeout (2 timeouts → stop). Order: refresh → remove **every** set
     spell not in the set-up → add missing set-up spells into first empty slot. The game ends
@@ -152,7 +173,7 @@ Current version: **1.44** (Presets tab: Save / Load / Apply, search, No Traits).
   - **Load Current Set** (button in the **Spells Set** section, right of Clear set-up; shown
     alone under the "Tick spells..." note when the set-up is empty):
     `LoadCurrentSetClicked()` sends the all-zero 0x102 refresh, sets `AP.show_until`; the 0x044
-    reply (`M._trt_packet`) calls `LoadCurrentSet(cur)` → replaces the designer with **all** set
+    reply (handled in `M._trt_tick`) calls `LoadCurrentSet(cur)` → replaces the designer with **all** set
     spells (`IdOfIdx`), clears
     `_loaded`. Silent on success (no status message); errors still show in the status line.
     Timeout in `M._trt_tick` falls back to the last known `AP.current`.
@@ -193,6 +214,16 @@ Current version: **1.44** (Presets tab: Save / Load / Apply, search, No Traits).
 
 ## Change log
 
+- **1.47** — Presets: Element dropdown also lists Slashing, Piercing and Blunt.
+- **1.46** — Presets: Refueling, Feather Barrier and Enervation were hidden by the Can Combo filter
+  (their traits have one 4-point spell, need 8, so no combination exists). Traits that can't reach
+  their points are now always listed with a note. Removed White Wind, Osmosis and Seedspray from
+  the trait sheet (not on this server). Presets now lists all 106 spells.
+- **1.45** — Fix: game crash "BluTracker threw an exception in event 'packet_in'
+  (EXCEPTION_ACCESS_VIOLATION)". Entity lookups for monster actions could pass an index above
+  the client's 2304-entity array (now bounded to < 0x900); all game-memory reads moved out of the
+  packet callback into the render tick (0x028 action queue, 0x044 pending slots, zone-in
+  settings reload / re-init); `IdOfIdx` no longer calls the client resource manager.
 - **1.44** — Presets: Load Current Set moved from Blue Points & Filters to the Spells Set
   section, next to Clear set-up.
 - 1.43 — Full data check against the 106 in-game spell cards (`cards/`): fixed 32 spells.

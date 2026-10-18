@@ -55,7 +55,6 @@ M.TRAITS = {
       spells = {
         { 16, 'Sheep Song',     2, 4 },
         { 16, 'Healing Breeze', 4, 4 },
-        { 94, 'White Wind',     5, 4 },
       } },
     { name = 'Clear Mind', need = 8, max = 4,
       rule = 'Any 2 spells. Every 2 more spells adds a tier, up to Clear Mind IV.',
@@ -117,7 +116,6 @@ M.TRAITS = {
         { 46, 'Magnetite Cloud', 3, 4 },
         { 50, 'Ice Break',       3, 4 },
         { 74, 'Reactor Cool',    5, 4 },
-        { 84, 'Osmosis',         5, 4 },
       } },
     { name = 'Max HP Boost', need = 8,
       rule = 'Any 2 spells. Every 2 more spells adds a tier.',
@@ -154,7 +152,6 @@ M.TRAITS = {
       spells = {
         {  4, 'Wild Oats',    3, 4 },
         {  4, 'Sprout Smack', 2, 4 },
-        { 61, 'Seedspray',    2, 4 },
         { 62, '1000 Needles', 5, 4 },
       } },
     { name = 'Lizard Killer', need = 8, max = 1,

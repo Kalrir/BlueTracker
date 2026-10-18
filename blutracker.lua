@@ -24,7 +24,7 @@
 
 addon.name    = 'BluTracker';
 addon.author  = 'Kalrir';
-addon.version = '1.44';
+addon.version = '1.47';
 addon.desc    = 'Blue Magic spell-learning tracker with a where-to-learn guide.';
 
 require('common');
@@ -220,13 +220,16 @@ ashita.events.register('text_in', 'text_in_cb', function(e)
     pcall(BlueMage.text_in, e);
 end);
 
+-- Set by packet 0x00A; the settings reload + re-init runs on the next frame
+-- (d3d_present) instead of inside the packet callback, while the client is
+-- still in the middle of loading the zone.
+local reinit_pending = false;
+
 ashita.events.register('packet_in', 'packet_in_cb', function(e)
     -- 0x00A = zone-in / character login: settings are per-character, so reload
     -- them and re-bind the module to the fresh cfg. 0x00B = zone-out: persist.
     if e.id == 0x00A then
-        cfg = settings.load(default_config);
-        sync_config_vars();
-        BlueMage.init(make_host());
+        reinit_pending = true;
     elseif e.id == 0x00B then
         settings.save();
     elseif e.id == 0x028 then
@@ -247,6 +250,15 @@ ashita.events.register('d3d_present', 'present_cb', function()
             print('[BluTracker] loaded. /blutracker (or /blut) to open.');
             vt._load_msg_frames = nil;
         end
+    end
+
+    if reinit_pending then
+        reinit_pending = false;
+        pcall(function()
+            cfg = settings.load(default_config);
+            sync_config_vars();
+            BlueMage.init(make_host());
+        end);
     end
 
     pcall(BlueMage.render);

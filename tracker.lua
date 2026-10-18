@@ -2563,10 +2563,16 @@ local function ParseAction(data)
 end
 
 -- Entity index for a server id (fast path: low 12 bits for monsters).
+-- Entity indexes are only valid below 0x900: the client's entity array has
+-- 2304 slots and Ashita doesn't bounds-check, so a bigger index reads past the
+-- array and crashes the game (EXCEPTION_ACCESS_VIOLATION). Never pass one.
 local function IndexOfServerId(ent, sid)
+    if type(sid) ~= 'number' then return nil end
     local guess = sid % 0x1000
-    local ok, v = pcall(function() return ent:GetServerId(guess) end)
-    if ok and v == sid then return guess end
+    if guess >= 1 and guess < 0x900 then
+        local ok, v = pcall(function() return ent:GetServerId(guess) end)
+        if ok and v == sid then return guess end
+    end
     for i = 1, 0x8FF do
         local ok2, v2 = pcall(function() return ent:GetServerId(i) end)
         if ok2 and v2 == sid then return i end
@@ -2677,14 +2683,33 @@ local function ApplyChatMatch(a, key)
     end
 end
 
+-- packet_in only copies the packet bytes; everything that reads game memory
+-- runs a moment later from render (M._drain_actions), never inside the
+-- packet callback itself.
+M._act_q = {}
 function M.packet_in(e)
     if e.id == 0x044 then
         if M._trt_packet then pcall(M._trt_packet, e) end
         return
     end
     if e.id ~= 0x028 or not seen then return end
+    local data = e.data
+    if type(data) ~= 'string' or #data < 20 then return end
+    local q = M._act_q
+    if #q < 64 then q[#q + 1] = data end
+end
+
+function M._drain_actions()
+    local q = M._act_q
+    if #q == 0 then return end
+    M._act_q = {}
+    for _, data in ipairs(q) do pcall(M._handle_action, data) end
+end
+
+function M._handle_action(data)
+    if not seen then return end
     if GetBluLevel() == nil then return end
-    local a = ParseAction(e.data)
+    local a = ParseAction(data)
     if not a or a.actor < 0x1000000 then return end   -- monsters/NPCs only
 
     local mm  = AshitaCore and AshitaCore:GetMemoryManager()
@@ -2695,8 +2720,11 @@ function M.packet_in(e)
         -- Any readable monster action (melee, readies, ...) proves packets work,
         -- so chat isn't parsed the old way before the first TP move finishes.
         if not packets_working then
-            local ok, v = pcall(function() return ent:GetServerId(a.actor % 0x1000) end)
-            if ok and v == a.actor then packets_working = true end
+            local gi = a.actor % 0x1000
+            if gi >= 1 and gi < 0x900 then
+                local ok, v = pcall(function() return ent:GetServerId(gi) end)
+                if ok and v == a.actor then packets_working = true end
+            end
         end
         return                                         -- count finished moves only
     end
@@ -3353,14 +3381,24 @@ do
     end
     for _, t in ipairs(TRD.TRAITS) do
         local tt = { name = t.name, rule = t.rule, note = t.note, need = t.need or 8, max = t.max, spells = {} }
+        local total = 0
         for _, s in ipairs(t.spells or {}) do
+            -- Only spells that exist on this server (the spell database = the
+            -- 106 in-game spells); sheet rows for later spells are skipped.
             local rec = byname[DB.keyify(s[2])]
-            tt.spells[#tt.spells + 1] = {
-                lvl = s[1], name = rec and rec.name or s[2], cost = s[3], pts = s[4],
-                rec = rec, id = DB.keyify(s[2]),
-            }
+            if rec then
+                tt.spells[#tt.spells + 1] = {
+                    lvl = s[1], name = rec.name, cost = s[3], pts = s[4],
+                    rec = rec, id = DB.keyify(s[2]),
+                }
+                total = total + (s[4] or 0)
+            end
         end
-        TRAITS[#TRAITS + 1] = tt
+        -- Not enough trait points among all its spells to ever gain the trait
+        -- (e.g. Resist Slow: Refueling alone is 4 / 8). Still listed; the Can
+        -- Combo filter doesn't hide these.
+        tt.unreachable = total < tt.need
+        if #tt.spells > 0 then TRAITS[#TRAITS + 1] = tt end
     end
 end
 
@@ -3586,6 +3624,11 @@ local function RenderTraitBody(t, visible, myLvl, learnedCount)
     local K, d = UIK, Design()
     imgui.Indent(12)
     if t.note then TextC(COL_WARN, t.note) end
+    if t.unreachable then
+        local pts = 0
+        for _, s in ipairs(t.spells) do pts = pts + (s.pts or 0) end
+        TextC(COL_WARN, ('Only %d / %d trait points from these spells.'):format(pts, t.need))
+    end
 
     -- Spell table: Set | Lv | Spell | Cost | Pts, sized to the panel (spell
     -- details are in the hover card).
@@ -3668,7 +3711,7 @@ end
 -- Element dropdown + Magic / Physical / Ranged checkboxes under the search
 -- box (session-only, like the search). 'None' = no element filter. With no
 -- type box ticked every type shows; ticked boxes combine as "any of".
-local TRT_ELEMENTS = { 'None', 'Fire', 'Ice', 'Wind', 'Earth', 'Thunder', 'Water', 'Light', 'Dark' }
+local TRT_ELEMENTS = { 'None', 'Fire', 'Ice', 'Wind', 'Earth', 'Thunder', 'Water', 'Light', 'Dark', 'Slashing', 'Piercing', 'Blunt' }
 local trt_elem = 'None'
 local trt_kind = { magic = false, phys = false, ranged = false }
 
@@ -3715,7 +3758,8 @@ local function RenderTraitReference(myLvl, learnedCount, per, pw)
             -- Spells left after the filters; skip the whole category when
             -- none of its spells survive. A search matching the trait name
             -- keeps all its spells; otherwise only matching spells stay.
-            local combo = cfg.bluemage_trait_can_combo and TraitCombos(t, myLvl, learnedCount) or nil
+            local combo = (cfg.bluemage_trait_can_combo and not t.unreachable)
+                and TraitCombos(t, myLvl, learnedCount) or nil
             local whole = (needle ~= '') and NameHit(t.name, needle)
             local filtering = FiltersActive(needle)
             local visible = {}
@@ -3989,12 +4033,8 @@ local function IdOfIdx(idx)
     if not idx or idx == 0 then return nil end
     local id = SHEET_ID_OF_IDX[idx]
     if id then return id end
-    local name
-    pcall(function()
-        local sp = AshitaCore:GetResourceManager():GetSpellById(idx + 0x200)
-        name = sp and sp.Name and sp.Name[1]
-    end)
-    if type(name) ~= 'string' or name == '' then name = IdxName(idx) end
+    if type(idx) ~= 'number' or idx < 1 or idx > 255 then return nil end
+    local name = IdxName(idx)
     local key = DB.keyify(name)
     if key == '' then key = 'spell' .. (idx + 0x200) end
     local e = ALL_BY_ID[key]
@@ -4207,27 +4247,34 @@ local function LoadCurrentSetClicked()
 end
 
 -- 0x044: current set spells (main or support BLU).
+-- Only copies the 20 slot bytes; the reply is handled from M._trt_tick
+-- (render), so nothing heavy runs inside the packet callback.
 function M._trt_packet(e)
     local data = e.data
     if type(data) ~= 'string' or #data < 0x1C then return end
     if data:byte(0x04 + 1) ~= BLU_JOB_ID then return end
     local cur = {}
     for slot = 1, BLU_SLOTS do cur[slot] = data:byte(0x08 + slot) or 0 end
-    AP.current = cur
-    if AP.show_until then
-        AP.show_until = nil
-        LoadCurrentSet(cur)
-    end
-    if AP.waiting then
-        AP.waiting = false
-        AP.timeouts = 0
-        AP.next_at = os.clock() + SET_SPEED
-    end
+    AP.pending = cur
 end
 
 -- One step per server reply, called every frame from M.render.
 function M._trt_tick()
     local now = os.clock()
+    if AP.pending then                             -- a 0x044 arrived
+        local cur = AP.pending
+        AP.pending = nil
+        AP.current = cur
+        if AP.show_until then
+            AP.show_until = nil
+            LoadCurrentSet(cur)
+        end
+        if AP.waiting then
+            AP.waiting = false
+            AP.timeouts = 0
+            AP.next_at = now + SET_SPEED
+        end
+    end
     if AP.show_until and now > AP.show_until then   -- no reply to Show Current Set
         AP.show_until = nil
         if AP.current then LoadCurrentSet(AP.current)
@@ -5082,6 +5129,9 @@ function M.render()
 
     -- Persist "seen" counts every so often (not on every chat line).
     FlushSeen(false)
+
+    -- Monster actions queued by packet_in (seen counter).
+    pcall(M._drain_actions)
 
     -- Traits tab: step an in-progress "Apply" (one spell change per reply).
     if M._trt_tick then pcall(M._trt_tick) end
