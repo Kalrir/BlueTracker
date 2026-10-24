@@ -22,7 +22,10 @@
 * Features:
 *   - Learned checkmarks are read automatically from the player's Blue Magic
 *     spellbook (IPlayer:HasSpell), polled on a throttle so they stay live.
-*     They are read-only; there is no manual toggle.
+*     They are read-only; there is no manual toggle. The spellbook is only read
+*     while BLU is main or support job; the flags are saved per character, so
+*     on other jobs the last known spells are used. BLU level and Blue Magic
+*     skill are cached the same way (M.blu_state, 1.49).
 *   - Chat fallback: only if the spellbook read is unavailable, watches chat
 *     for the "learns <Spell>" message and marks the spell.
 *   - Click a spell name to see where to learn it (monster / level / zone).
@@ -101,6 +104,13 @@ if not ok_mm or type(MOBMOVES) ~= 'table' then MOBMOVES = {} end
 
 local M = {}
 
+-- Blue Magic skill cap by level (rank A+), for the Spells-tab heading (1.52).
+-- Kept on M (the main chunk is near Lua's 200-local limit).
+do
+    local ok, caps = pcall(require, 'data/bluemage_skillcaps')
+    M.SKILLCAP = (ok and type(caps) == 'table') and caps or {}
+end
+
 -- Spellbook sync: the learned checkmarks are driven by the player's actual
 -- Blue Magic spellbook (IPlayer:HasSpell), not by manual clicks. We poll on a
 -- throttle so newly-learned spells / character changes are reflected live.
@@ -133,6 +143,9 @@ end
 -- genuinely distinct zones).
 local ZONE_ALIAS = {
     ["Pso'Xja"] = 'PsoXja',
+    -- Venom Shell's Coralline Uragnite row names the island; the game zone is
+    -- just "Bibiki Bay" (an exact match missed it in the mini tracker).  1.48
+    ["Bibiki Bay - Purgonorgo Isle"] = 'Bibiki Bay',
 }
 local function Canon(name)
     if not name then return name end
@@ -1006,6 +1019,63 @@ local function GetCurrentZone()
     return zid, ZONES[zid]
 end
 
+-- ---------- Cached BLU state (1.49) ----------
+-- BLU is your main or support job right now (party self-slot).
+function M.on_blu()
+    local mm = AshitaCore and AshitaCore:GetMemoryManager()
+    local party = mm and mm:GetParty()
+    if not party then return false end
+    local ok, mj, sj = pcall(function()
+        return party:GetMemberMainJob(0), party:GetMemberSubJob(0)
+    end)
+    return ok and (mj == BLU_JOB_ID or sj == BLU_JOB_ID) or false
+end
+
+-- Your BLU level and Blue Magic skill, live when BLU is your main job, else the
+-- last values seen on BLU (cached per character in cfg.bluemage_cache_level /
+-- cfg.bluemage_cache_skill). Returns lvl, skill, live; lvl is nil if BLU has
+-- never been seen on this character. The cache is not updated inside a
+-- level-capped zone (data/bluemage_zonecaps.lua) or while you have Level
+-- Restriction (M.level_restricted), where level and skill are
+-- held at the cap, and a skill that still reads 0 while loading is ignored.
+-- You have the Level Restriction status effect (id 143), which the game puts
+-- on you in every level-capped area and battlefield (1.50).
+function M.level_restricted()
+    local ok, hit = pcall(function()
+        local buffs = AshitaCore:GetMemoryManager():GetPlayer():GetBuffs()
+        if type(buffs) ~= 'table' then return false end
+        for _, b in pairs(buffs) do if b == 143 then return true end end
+        return false
+    end)
+    return ok and hit or false
+end
+
+function M.blu_state()
+    local lvl = GetBluLevel()
+    if type(lvl) == 'number' and lvl > 0 then
+        local skill = GetBlueSkill()
+        if type(skill) ~= 'number' or skill <= 0 then skill = nil end
+        if cfg then
+            local _, zn = GetCurrentZone()
+            if not (zn and ZONECAPS[zn]) and not M.level_restricted() then
+                local dirty = false
+                if cfg.bluemage_cache_level ~= lvl then cfg.bluemage_cache_level = lvl; dirty = true end
+                if skill and cfg.bluemage_cache_skill ~= skill then cfg.bluemage_cache_skill = skill; dirty = true end
+                if dirty and settings then pcall(settings.save) end
+            end
+            if not skill then
+                local cs = tonumber(cfg.bluemage_cache_skill)
+                if cs and cs > 0 then skill = cs end
+            end
+        end
+        return lvl, skill, true
+    end
+    if not cfg then return nil, nil, false end
+    local cl, cs = tonumber(cfg.bluemage_cache_level), tonumber(cfg.bluemage_cache_skill)
+    if not cl or cl <= 0 then return nil, nil, false end
+    return cl, (cs and cs > 0) and cs or nil, false
+end
+
 -- Player's live position as (wx, wy, wh): wx/wy are the horizontal world plane
 -- matching the mob-map (world x, world z), and wh is height (world y), used to
 -- pick the right floor in vertically stacked zones. Returns nil if unreadable.
@@ -1251,7 +1321,12 @@ local function SyncFromSpellbook()
     if not mm then return end
     local ok_p, player = pcall(function() return mm:GetPlayer() end)
     if not ok_p or not player then return end
+    -- 1.49: only trust the spellbook while BLU is your main or support job.
+    -- Otherwise the saved per-character flags (cfg.bluemage_data.learned) are
+    -- kept as they are, so the tracker still knows your spells on other jobs.
+    if not M.on_blu() then return end
 
+    local read, n = {}, 0
     for _, r in ipairs(DB.SPELLS) do
         local sid = SID[r.key]
         if sid then
@@ -1262,9 +1337,19 @@ local function SyncFromSpellbook()
                 spellbook_ok = false
                 return
             end
-            learned[r.key] = has and true or false
+            read[r.key] = has and true or false
+            if has then n = n + 1 end
         end
     end
+    -- An all-empty read while spells are saved = spell list not loaded yet.
+    if n == 0 then
+        for _, v in pairs(learned) do if v then return end end
+    end
+    local changed = false
+    for k, v in pairs(read) do
+        if learned[k] ~= v then learned[k] = v; changed = true end
+    end
+    if changed and settings then pcall(settings.save) end
 end
 
 -- Strip FFXI auto-translate / color control bytes so plain substring
@@ -1282,8 +1367,8 @@ end
 local function PassesFilter(r, needle, bluLvl, skill)
     if cfg.bluemage_hide_learned and learned[r.key] then return false end
     -- "<= Skill level": only spells your current Blue Magic skill can learn
-    -- (skill >= the spell's required skill). No effect unless BLU is your main
-    -- job and the skill can be read.
+    -- (skill >= the spell's required skill). Uses the cached skill when not on
+    -- BLU (M.blu_state); no effect until the skill has been read once.
     if cfg.bluemage_only_my_skill and bluLvl and skill and (REQSK[r.key] or 0) > skill then return false end
     if cfg.bluemage_only_my_level and bluLvl and r.lvl > bluLvl then return false end
     if roleFilter  ~= 'All' and r.role  ~= roleFilter  then return false end
@@ -2252,7 +2337,7 @@ end
 -- spell (the cached `learned` flags only refresh every ~0.5s), updates the
 -- cache, and falls back to the cache if the spellbook can't be read.
 function SeenBy.is_learned(key)
-    if spellbook_ok then
+    if spellbook_ok and M.on_blu() then
         local ok, has = pcall(function()
             local sid = SID[key]
             local player = sid and AshitaCore:GetMemoryManager():GetPlayer()
@@ -3057,8 +3142,7 @@ local function RenderTracker()
         end)
     end
     if begin_ok then
-        local bluLvl = GetBluLevel()
-        local skill  = GetBlueSkill()
+        local bluLvl, skill = M.blu_state()   -- cached when not on BLU (1.49)
 
         if mode == 'specific' then
             UIK.heading_center('Tracked Spells')
@@ -3211,8 +3295,7 @@ local function RenderZoneTab()
         return
     end
 
-    local bluLvl = GetBluLevel()
-    local skill  = GetBlueSkill()
+    local bluLvl, skill = M.blu_state()   -- cached when not on BLU (1.49)
     local list   = AllSpellsInZone(zoneTabZone, zoneTabHideLearned[1])
 
     -- Split body: spell list on the left, zone map on the right. Size the body
@@ -3713,13 +3796,25 @@ end
 -- type box ticked every type shows; ticked boxes combine as "any of".
 local TRT_ELEMENTS = { 'None', 'Fire', 'Ice', 'Wind', 'Earth', 'Thunder', 'Water', 'Light', 'Dark', 'Slashing', 'Piercing', 'Blunt' }
 local trt_elem = 'None'
-local trt_kind = { magic = false, phys = false, ranged = false }
+local trt_kind = { magic = false, phys = false, ranged = false, mab = false }
+
+-- "MAB" box (1.51): spells Magic Attack Bonus boosts = the magical nukes.
+-- Not breath spells (damage from HP / level), physical spells, drains,
+-- fixed / HP-based damage (1000 Needles, Self-Destruct) or the no-damage
+-- Temporal Shift (stun) / Plasma Charge (Shock Spikes).
+local MAB_EXCLUDE = { ['1000needles'] = true, selfdestruct = true, temporalshift = true, plasmacharge = true }
+local function MabHit(r)
+    return r.kind == 'Mag' and r.role == 'Damage' and not MAB_EXCLUDE[r.key]
+       and not tostring(r.prop or ''):find('^Breath')
+end
 
 local function KindHit(s)
     local r = s.rec
     local any = trt_kind.magic or trt_kind.phys or trt_kind.ranged
-    if not r then return trt_elem == 'None' and not any end
+    if not r then return trt_elem == 'None' and not any and not trt_kind.mab end
     if trt_elem ~= 'None' and r.elem ~= trt_elem then return false end
+    -- MAB narrows the list (on top of the type boxes), it isn't an "any of" type.
+    if trt_kind.mab and not MabHit(r) then return false end
     if not any then return true end
     local ranged = (r.elem == 'Ranged')
     if trt_kind.magic  and r.kind ~= 'Phys' then return true end
@@ -3730,7 +3825,7 @@ end
 
 -- Any search / element / type filter in use?
 local function FiltersActive(needle)
-    return needle ~= '' or trt_elem ~= 'None' or trt_kind.magic or trt_kind.phys or trt_kind.ranged
+    return needle ~= '' or trt_elem ~= 'None' or trt_kind.magic or trt_kind.phys or trt_kind.ranged or trt_kind.mab
 end
 
 -- While filtering, matching traits start collapsed and open on click; that
@@ -3739,7 +3834,7 @@ end
 local filter_open, filter_sig = {}, nil
 local function FilterSig(needle)
     return table.concat({ needle, trt_elem, tostring(trt_kind.magic), tostring(trt_kind.phys),
-        tostring(trt_kind.ranged) }, '|')
+        tostring(trt_kind.ranged), tostring(trt_kind.mab) }, '|')
 end
 
 local function RenderTraitReference(myLvl, learnedCount, per, pw)
@@ -3921,7 +4016,7 @@ local function RenderElementFilter(w)
     end
 end
 
--- Magic / Physical / Ranged boxes (Spell type row, after the Element dropdown).
+-- Magic / Physical / Ranged / MAB boxes (Spell type row, after the Element dropdown).
 local function RenderTypeFilters()
     local function box(label, key)
         local v = { trt_kind[key] and true or false }
@@ -3932,6 +4027,11 @@ local function RenderTypeFilters()
     box('Physical##trt_k_phys', 'phys')
     imgui.SameLine(0, 14)
     box('Ranged##trt_k_rng', 'ranged')
+    imgui.SameLine(0, 14)
+    box('MAB##trt_k_mab', 'mab')
+    if imgui.IsItemHovered() then
+        imgui.SetTooltip('Only spells Magic Attack Bonus boosts (magical nukes). Breath, physical, drain and fixed-damage spells are left out.')
+    end
 end
 
 -- ---------- Max Blue Magic set points ----------
@@ -3951,14 +4051,28 @@ local function BlueJobLevel()
 end
 
 -- Server rule (LSB blueutils): 10 points, +5 at levels 11, 21, 31 ... 71
--- (45 at 71-75). HorizonXI has no Assimilation merits; instead BLU gets a
--- built-in Assimilation: +5 once 90 or more spells are learned (main job).
-local ASSIM_SPELLS = 90
-local ASSIM_BONUS  = 5
-local function AssimBonus()
-    return (CountLearned() >= ASSIM_SPELLS) and ASSIM_BONUS or 0
+-- (45 at 71-75), from your current (possibly level-capped) BLU level.
+-- HorizonXI has no Assimilation merits; instead BLU gets a hidden built-in
+-- Assimilation from the TOTAL number of spells learned (horizonffxi.wiki/BLU):
+-- 50-59 = +1, 60-69 = +2, 70-79 = +3, 80-89 = +4, 90+ = +5 (1.50). All learned
+-- spells count, even inside a level cap: Lv50 cap with 52 spells = 30 + 1 = 31.
+local ASSIM_SPELLS = 50   -- first tier
+local ASSIM_STEP   = 10   -- spells per further +1
+local ASSIM_MAX    = 5
+local function AssimBonusFor(n)
+    if n < ASSIM_SPELLS then return 0 end
+    return math.min(ASSIM_MAX, math.floor((n - ASSIM_SPELLS) / ASSIM_STEP) + 1)
 end
--- Highest value the manual slider allows: 45, or 50 with 90+ spells.
+local function AssimBonus()
+    return AssimBonusFor(CountLearned())
+end
+-- Spells needed for the next +1 (nil when already at +5).
+local function AssimNext(n)
+    local b = AssimBonusFor(n)
+    if b >= ASSIM_MAX then return nil end
+    return ASSIM_SPELLS + b * ASSIM_STEP
+end
+-- Highest value the manual slider allows: 45 + Assimilation (up to 50).
 local function ManualMaxPoints()
     return 45 + AssimBonus()
 end
@@ -3978,14 +4092,15 @@ local function MaxBluePoints()
             cfg.bluemage_trait_last_level = lvl; settings.save()
         end
     else
-        lvl, which = cfg.bluemage_trait_last_level or 75, 'last'
+        local cl = tonumber(cfg.bluemage_cache_level)
+        lvl, which = (cl and cl > 0) and cl or cfg.bluemage_trait_last_level or 75, 'last'
     end
     local base  = BluePointsForLevel(lvl)
     local bonus = (which ~= 'sub') and AssimBonus() or 0   -- main job only
     local src = (which == 'main' and ('Lv%d BLU'):format(lvl))
              or (which == 'sub'  and ('Lv%d BLU (support job)'):format(lvl))
              or ('Lv%d BLU (last seen - not on BLU now)'):format(lvl)
-    local expl = src .. ((bonus > 0) and (': %d + %d for 90+ spells'):format(base, bonus) or '')
+    local expl = src .. ((bonus > 0) and (': %d + %d Assimilation'):format(base, bonus) or '')
     return base + bonus, expl, lvl, which
 end
 
@@ -4682,7 +4797,9 @@ end
 
 local function RenderTraitsTab()
     local K, UI = UIK, UIK.UI
-    local myLvl = GetBluLevel()
+    -- BLU main/support level now, else the cached main level (1.49).
+    local myLvl = BlueJobLevel()
+    if not myLvl then myLvl = (M.blu_state()) end
     local learnedCount = CountLearned()
     local maxpts, expl, plvl, pwhich = MaxBluePoints()
 
@@ -4693,7 +4810,7 @@ local function RenderTraitsTab()
     -- ---- Controls ----
     K.section_begin('trt_controls', 'Blue Points & Filters', pw)
     if K.rows_begin('##trt_rows_controls') then
-        K.row('Blue points', 'Worked out from your BLU level: 10, +5 at Lv11/21/31/41/51/61/71 = 45 at 75. HorizonXI adds +5 (built-in Assimilation) once you know 90 or more spells. Tick Set manually to pick your own value.')
+        K.row('Blue points', 'Worked out from your BLU level (the capped level inside a level-capped area): 10, +5 at Lv11/21/31/41/51/61/71 = 45 at 75. HorizonXI adds built-in Assimilation from the spells you know: +1 at 50, +1 more per 10 spells, +5 at 90. Tick Set manually to pick your own value.')
         K.text(UI.value, tostring(maxpts))
         imgui.SameLine(0, 8); K.text(UI.dim, '(' .. expl .. ')')
         imgui.SameLine(0, 14)
@@ -4706,16 +4823,21 @@ local function RenderTraitsTab()
         if cfg.bluemage_trait_manual then
             local cap = ManualMaxPoints()
             if (cfg.bluemage_trait_points or 45) > cap then cfg.bluemage_trait_points = cap end
-            K.row('Max points', 'Your maximum Blue Magic set points. Up to 45, or 50 once you know 90 or more spells (HorizonXI built-in Assimilation). Ctrl+click the slider to type a value.')
+            K.row('Max points', 'Your maximum Blue Magic set points. Up to 45 plus your Assimilation bonus (+1 per 10 spells from 50, up to 50 at 90 spells). Ctrl+click the slider to type a value.')
             K.slider('int', '##trt_maxpts', cfg.bluemage_trait_points or 45, 0, cap, '%d', nil,
                 function(v) cfg.bluemage_trait_points = math.max(0, math.min(cap, v)) end)
             K.side(('max %d'):format(cap))
         end
-        K.row('Assimilation', 'HorizonXI built-in Assimilation: +5 blue points once you have learned 90 or more Blue Magic spells (main job). Replaces the retail merits.')
-        if nLearned >= ASSIM_SPELLS then
-            K.text({ 0.55, 0.88, 0.55, 1.0 }, ('+%d  (%d spells learned)'):format(ASSIM_BONUS, nLearned))
-        else
-            K.text(UI.dim, ('+0  (%d / %d spells learned)'):format(nLearned, ASSIM_SPELLS))
+        K.row('Assimilation', 'HorizonXI built-in Assimilation (main job), from the total spells you have learned: 50-59 = +1, 60-69 = +2, 70-79 = +3, 80-89 = +4, 90+ = +5. Still applies in level-capped areas. Replaces the retail merits.')
+        do
+            local ab, nx = AssimBonusFor(nLearned), AssimNext(nLearned)
+            local tail = nx and ('  (%d spells learned - next +1 at %d)'):format(nLearned, nx)
+                          or ('  (%d spells learned - max)'):format(nLearned)
+            if ab > 0 then
+                K.text({ 0.55, 0.88, 0.55, 1.0 }, ('+%d'):format(ab) .. tail)
+            else
+                K.text(UI.dim, '+0' .. tail)
+            end
         end
 
         K.row('Filters', 'Narrow the Trait Sets list. Hover each box for details.')
@@ -5200,8 +5322,7 @@ function M.render()
 
     if begin_ok and UIK.tab_bar_begin('##blu_main_tabs') then
     if UIK.tab_item('##blu_main_tabs', 'Spells', TabFlags('Spells')) then
-        local bluLvl  = GetBluLevel()
-        local skill   = GetBlueSkill()
+        local bluLvl, skill, bluLive = M.blu_state()   -- cached when not on BLU (1.49)
         local total   = DB.COUNT
         local nLearn  = CountLearned()
         local frac    = (total > 0) and (nLearn / total) or 0
@@ -5209,10 +5330,14 @@ function M.render()
         -- ---- Progress (left-aligned): level / skill title, Learned, bar ----
         local UI = UIK.UI
         if bluLvl then
-            if skill then
-                UIK.heading(('Lv %d - Blue Magic Skill %d'):format(bluLvl, skill))
+            local cap = M.SKILLCAP[bluLvl]
+            local h = skill and (cap and ('Lv %d - Blue Magic Skill %d / %d'):format(bluLvl, skill, cap)
+                                     or ('Lv %d - Blue Magic Skill %d'):format(bluLvl, skill))
+                             or ('Lv %d'):format(bluLvl)
+            if bluLive then
+                UIK.heading(h)
             else
-                UIK.heading(('Lv %d'):format(bluLvl))
+                UIK.heading(h .. '  (last seen on BLU)', UI.dim)
             end
         else
             UIK.heading('(set BLU as main job to see learn readiness)', UI.dim)
@@ -5252,7 +5377,7 @@ function M.render()
         end
         if imgui.IsItemHovered() then
             imgui.SetTooltip((bluLvl and skill) and ('Only show spells your Blue Magic skill (%d) can learn.'):format(skill)
-                or 'Only show spells your Blue Magic skill can learn (needs BLU as main job).')
+                or 'Only show spells your Blue Magic skill can learn (play BLU as main job once so it can be read).')
         end
         imgui.SameLine(0, 10)
         local ol = { cfg.bluemage_only_my_level or false }

@@ -2,7 +2,7 @@
 
 Blue Magic tracker addon for **Ashita v4 / HorizonXI** (75-era, LSB server).
 Install path: `<Ashita>/addons/blutracker/` — load with `/addon load blutracker`.
-Current version: **1.47** (Presets tab: Save / Load / Apply, search, No Traits).
+Current version: **1.52** (Presets tab: Save / Load / Apply, search, No Traits).
 
 > Keep this file up to date after every change and re-upload it to the
 > "FFXI BlueTracker" project.
@@ -32,7 +32,8 @@ Current version: **1.47** (Presets tab: Save / Load / Apply, search, No Traits).
 | `bluemage_traits.lua` (`TRD.TRAITS`) | Era+ trait sheet (set cost / trait points / level verified against the in-game cards in 1.43; Store TP, Counter, Resist Gravity, Resist Slow added): `{ name, need, max, rule, note, spells = { {lvl, name, setCost, traitPts}, ... } }`. Only remaining `note`: "Frost Breath adds a tier on its own." (the Geist Wall / Blood Saber "bugged high" note was removed in 1.36 at the user's request — they are still bugged). |
 | `bluemage_learnfrom.lua` (`LF.DATA`) | key -> list of `{ mob, level, zone, isNM }`. |
 | `bluemage_mrl.lua` / `bluemage_reqskill.lua` | Min level / skill to learn each spell. |
-| `bluemage_zones.lua` / `bluemage_zonecaps.lua` | Zone id -> name; level-capped zones (filters learn-from rows). |
+| `bluemage_skillcaps.lua` | Blue Magic skill cap per BLU level 1-75 (rank A+, 276 at 75; FFXIclopedia). Loaded into `M.SKILLCAP` (pcall). |
+| `bluemage_zones.lua` / `bluemage_zonecaps.lua` | Zone id -> name; level-capped zones (filters learn-from rows; also stops the off-job level/skill cache). Caps: Promyvion-Holla/Dem/Mea + Spire of Holla/Dem/Mea 30, Promyvion-Vahzl + Spire of Vahzl 50, Riverne-Site A01 40, B01 50, Phomiuna Aqueducts 40. |
 | `bluemage_mobmoves.lua` | Extra monster-move names for the "seen" counter. |
 | `mob_positions.lua` | Spawn points per zone/mob (big, generated). |
 | `zone_map_index.lua` | Zone -> client map table index. |
@@ -43,6 +44,8 @@ Current version: **1.47** (Presets tab: Save / Load / Apply, search, No Traits).
 
 - `default_config` — every persisted key (per character via Ashita `settings`).
   Spells-tab filter keys: `bluemage_hide_learned`, **`bluemage_only_my_skill`**, `bluemage_only_my_level`.
+  Off-job cache (1.49): **`bluemage_cache_level`**, **`bluemage_cache_skill`** (0 = never seen on BLU);
+  learned spells are cached in `bluemage_data.learned` (per character).
   Traits-tab keys: `bluemage_trait_manual`, `_points`, `_last_level`,
   `_only_learned`, `_only_level`, `_can_combo`, `_design` (spell id -> true; sheet id or DB key),
   **`_sets`** (saved set-ups), **`_loaded`** (name of last saved/loaded set-up).
@@ -60,10 +63,11 @@ Current version: **1.47** (Presets tab: Save / Load / Apply, search, No Traits).
 | Lines | Section |
 |---|---|
 | 1–130 | Requires (DB, LF, SID, MRL, REQSK, ZONES, caps filter, POS, gamemap, BlueLearn, MOBMOVES), `SORTED`, zone maps |
+| ~134 | `ZONE_ALIAS` / `Canon(name)` — maps learn-from zone strings to the game's zone name (`Pso'Xja` → `PsoXja`, `Bibiki Bay - Purgonorgo Isle` → `Bibiki Bay`). Every zone match (mini tracker Zone mode, Zone tab, maps) goes through `Canon`, so a learn-from zone string that isn't the exact game zone name needs an alias here. |
 | 380–400 | Main-chunk state: `cfg`, `vt`, `settings`, `learned`, `tracked`, `seen`, `BLU_JOB_ID = 16` |
 | 500–915 | `UIK` UI kit (panels `section_begin/end`, `rows_begin/row`, `check`, `button`, `slider`, `note`, `block_begin`, `frame_begin`, headings, tab bar styling) |
 | 923–960 | Window theme push/pop |
-| 964–1250 | Helpers: `GetBluLevel`, `GetBlueSkill`, zone/pos, floor caches, `SpellsInZone`, `CountLearned`, `SyncFromSpellbook` |
+| 964–1300 | Helpers: `GetBluLevel`, `GetBlueSkill` (live, BLU main only), `GetCurrentZone`, **`M.on_blu()`** (BLU main or sub), **`M.blu_state()`** → `lvl, skill, live` (see Off-job cache), zone/pos, floor caches, `SpellsInZone`, `CountLearned`, `SyncFromSpellbook` |
 | 1280–1530 | Spells-tab rows/filters/progress bar. `PassesFilter(r, needle, bluLvl, skill)` — Hide learned, **<= Skill level** (`REQSK[key] <= skill`, only when BLU is main job and skill is readable), <= my level, role/trait/family combos, search. `LearnStatus` = green/yellow/dim colouring |
 | 1530–2210 | Map drawing (mini-map hover, zone map) |
 | 2210–2270 | `SeenBy` per-monster counts |
@@ -77,6 +81,21 @@ Current version: **1.47** (Presets tab: Save / Load / Apply, search, No Traits).
 | 4526 | `RenderConfigTab()` (Settings tab) |
 | ~4700 | `M.render()` — per-frame: splash, seen flush, **`M._trt_tick()`**, spellbook sync, tracker window, main window + tabs, then **`M._trt_windows()`** |
 | 4981+ | `M.command`, `M.seen_command`, `M.debug_floors`, `M.text_in`, `M.splash_preview`, `M.unload`, `M.reset_settings` |
+
+### Off-job cache (1.49)
+
+- `M.blu_state()` — on BLU main: live level / skill, and writes them to `cfg.bluemage_cache_level` /
+  `_skill` (saved on change). Not written inside a `ZONECAPS` zone or while **`M.level_restricted()`** (Level
+  Restriction status, buff id 143 — covers capped battlefields too) (level and skill held at the cap), and a
+  skill still reading 0 while loading is ignored (falls back to the cached skill). Off BLU main: returns
+  the cached values with `live = false` (nil if BLU was never seen).
+- Used by the Spells tab (heading shows "(last seen on BLU)" when cached), filters, Zones tab and the
+  mini tracker. Presets uses `BlueJobLevel()` (live main/sub) first, then the cached level;
+  `MaxBluePoints` off BLU prefers `bluemage_cache_level` over `bluemage_trait_last_level`.
+- Seen counter (`CountSeen`, `M._handle_action`) and Apply still need BLU live (`GetBluLevel` / `BlueJobLevel`).
+- `SyncFromSpellbook` only reads while `M.on_blu()`; an all-empty read while spells are saved is
+  skipped (spell list not loaded yet); `settings.save()` when a flag changes. `SeenBy.is_learned`
+  only reads live on BLU.
 
 > The main chunk is near Lua's 200-local limit — new features go inside a
 > closure (like the Traits/Counter tabs) or hang off `M`.
@@ -130,7 +149,9 @@ Current version: **1.47** (Presets tab: Save / Load / Apply, search, No Traits).
   - `RenderTypeFilters()` — Magic / Physical / Ranged checkboxes on the **"Spell type" row at the
     bottom of the Blue Points & Filters panel**, right after the Element dropdown
     (`trt_kind`; none ticked = all types; ticked = any of; Physical excludes Ranged; Ranged =
-    `elem == 'Ranged'`).
+    `elem == 'Ranged'`). **MAB** box after Ranged (1.51, `trt_kind.mab`): narrows (AND, not "any of") to
+    `MabHit(r)` = kind Mag + role Damage, prop not "Breath...", not in `MAB_EXCLUDE` (1000 Needles,
+    Self-Destruct, Temporal Shift, Plasma Charge) — the 14 magical nukes Magic Attack Bonus boosts.
   - `RenderElementFilter(w)` — "Element: X" combo, **first item on the "Spell type" row**
     (width from `ElementComboWidth()` = longest label + arrow) (`TRT_ELEMENTS`: None +
     Fire/Ice/Wind/Earth/Thunder/Water/Light/Dark + Slashing/Piercing/Blunt (physical damage types,
@@ -152,7 +173,11 @@ Current version: **1.47** (Presets tab: Save / Load / Apply, search, No Traits).
   - `RenderNoTraits(myLvl, pw)` — "No Traits (N)": every `EXTRAS` spell (no job trait), table
     Set | Lv | Spell | Cost with a checkbox into the designer; honours the level/learned filters
     and the search / element / type filters; hover card shows the spell details.
-- `BlueJobLevel`, `MaxBluePoints` (10 +5 per 10 levels, +5 Assimilation at 90+ spells).
+- `BlueJobLevel`, `MaxBluePoints` (10 +5 per 10 levels from the current, possibly capped, level + Assimilation).
+  HorizonXI Assimilation (hidden, main job) from **total** learned spells (horizonffxi.wiki/BLU):
+  `AssimBonusFor(n)` = 50-59 +1, 60-69 +2, 70-79 +3, 80-89 +4, 90+ +5 (`ASSIM_SPELLS` 50, `ASSIM_STEP` 10,
+  `ASSIM_MAX` 5); `AssimNext(n)` = spells for the next +1. Confirmed in game: Lv50 cap, 52 spells = 31.
+  `ManualMaxPoints` = 45 + Assimilation.
 - **Saved set-ups + Apply** (`-- ---------- Saved set-ups + Apply to the game ----------`):
   - Storage: `SavedSets()` → `cfg.bluemage_trait_sets` = array of `{ name, ids = {spell ids} }`
     (older saves may still carry an ignored `reserved` field).
@@ -214,6 +239,22 @@ Current version: **1.47** (Presets tab: Save / Load / Apply, search, No Traits).
 
 ## Change log
 
+- **1.52** — Spells tab heading shows "Blue Magic Skill current / max" (max = skill cap for your level, or the
+  capped level in a level-capped area) from new `data/bluemage_skillcaps.lua`.
+- **1.51** — Presets: MAB checkbox on the Spell type row (after Ranged) — shows only spells Magic Attack
+  Bonus boosts (magical nukes; breath, physical, drain and fixed-damage spells left out).
+- **1.50** — Presets: Assimilation is tiered (+1 at 50 spells, +1 per 10 more, +5 at 90) instead of a flat
+  +5 at 90; counts all learned spells even in level-capped areas (Lv50 cap + 52 spells = 31). Assimilation
+  row shows the next tier. Zone caps: added Spire of Holla/Dem/Mea (30) and Spire of Vahzl (50). Off-job
+  cache also skips saving while you have Level Restriction (buff 143).
+- **1.49** — Off-job cache: learned spells, BLU level and Blue Magic skill are kept per character
+  when you're not on BLU (spellbook only read on BLU main/sub; level/skill cached from BLU main, not in
+  level-capped zones). Spells/Zones/Presets tabs and the mini tracker use the cached values; the Spells
+  heading says "(last seen on BLU)".
+- **1.48** — Fix: Venom Shell missing from the mini tracker (Zone mode) in Bibiki Bay. Its Coralline
+  Uragnite row's zone is "Bibiki Bay - Purgonorgo Isle", which never matched the game zone "Bibiki Bay";
+  added a `ZONE_ALIAS` entry (also merges the duplicate Zone-tab entry and fixes the spawn-map hover).
+  Audit: it was the only learn-from zone string not matching a game zone name.
 - **1.47** — Presets: Element dropdown also lists Slashing, Piercing and Blunt.
 - **1.46** — Presets: Refueling, Feather Barrier and Enervation were hidden by the Can Combo filter
   (their traits have one 4-point spell, need 8, so no combination exists). Traits that can't reach

@@ -24,7 +24,7 @@
 
 addon.name    = 'BluTracker';
 addon.author  = 'Kalrir';
-addon.version = '1.47';
+addon.version = '1.52';
 addon.desc    = 'Blue Magic spell-learning tracker with a where-to-learn guide.';
 
 require('common');
@@ -50,6 +50,8 @@ local default_config = T{
     bluemage_hide_learned  = false,  -- filter: hide already-learned spells
     bluemage_only_my_level = false,  -- filter: only spells at/below your BLU level
     bluemage_only_my_skill = false,  -- filter: only spells your Blue Magic skill can learn
+    bluemage_cache_level   = 0,      -- last BLU main-job level seen (used off BLU)
+    bluemage_cache_skill   = 0,      -- last Blue Magic skill seen on BLU main (used off BLU)
     -- Mini-map / zone-map options
     bluemage_map_scale       = 1.0,   -- size multiplier for the hover mini-maps
     bluemage_show_player     = true,  -- draw a marker at the player's live position
